@@ -1,35 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-import os
-
-import numpy as np
 import style3dsim as sim
 import warp as wp
-from pxr import Usd, UsdGeom
 
 import newton
 import newton.examples
 import newton.usd
 import newton.utils
 from newton import Mesh, ParticleFlags
+from newton.solvers import style3d
 from style3d.style3d_pro import SolverStyle3DPro
+from style3d.style3d_pro.solver_style3d_pro import sim_log_callback
 
 
 class Example:
-    def __init__(self, viewer):
+    def __init__(self, viewer, args):
         # setup simulation parameters first
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -38,14 +24,17 @@ class Example:
         self.sim_substeps = 10
         self.sim_time = 0.0
         self.sim_dt = self.frame_dt / self.sim_substeps
+
         self.iterations = 4
 
         self.viewer = viewer
-        self.viewer._paused = True
-        builder = newton.Style3DModelBuilder(up_axis=newton.Axis.Z)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        newton.solvers.SolverStyle3D.register_custom_attributes(builder)
 
         use_cloth_mesh = True
         if use_cloth_mesh:
+            from pxr import Usd
+
             asset_path = newton.utils.download_asset("style3d")
 
             # Garment
@@ -56,43 +45,41 @@ class Example:
             usd_stage = Usd.Stage.Open(str(asset_path / "garments" / (garment_usd_name + ".usd")))
             usd_prim_garment = usd_stage.GetPrimAtPath(str("/Root/" + garment_usd_name + "/Root_Garment"))
 
-            garment_mesh = newton.usd.get_mesh(usd_prim_garment, load_uvs=True)
-            garment_mesh_indices = garment_mesh.indices
-            garment_mesh_points = garment_mesh.vertices[:, [2, 0, 1]]  # y-up to z-up
-            garment_mesh_uv = garment_mesh.uvs * 1e-3
-
-            # Load UV indices separately (not part of Mesh class)
-            garment_prim = UsdGeom.PrimvarsAPI(usd_prim_garment).GetPrimvar("st")
-            garment_mesh_uv_indices = np.array(garment_prim.GetIndices())
+            garment_mesh, garment_mesh_uv_indices = newton.usd.get_mesh(
+                usd_prim_garment,
+                load_uvs=True,
+                preserve_facevarying_uvs=True,
+                return_uv_indices=True,
+            )
+            garment_mesh_uv = garment_mesh.uvs * 1.0e-3
 
             # Avatar
-            path=str(asset_path / "avatars" / "Female.usd")
-
-            usd_stage = Usd.Stage.Open(path)
+            usd_stage = Usd.Stage.Open(str(asset_path / "avatars" / "Female.usd"))
             usd_prim_avatar = usd_stage.GetPrimAtPath("/Root/Female/Root_SkinnedMesh_Avatar_0_Sub_2")
             avatar_mesh = newton.usd.get_mesh(usd_prim_avatar)
             avatar_mesh_indices = avatar_mesh.indices
-            avatar_mesh_points = avatar_mesh.vertices[:, [2, 0, 1]]  # y-up to z-up
+            avatar_mesh_points = avatar_mesh.vertices
 
-            builder.add_aniso_cloth_mesh(
+            style3d.add_cloth_mesh(
+                builder,
                 pos=wp.vec3(0, 0, 0),
-                rot=wp.quat_identity(),
+                rot=wp.quat_from_axis_angle(axis=wp.vec3(1, 0, 0), angle=wp.pi / 2.0),
                 vel=wp.vec3(0.0, 0.0, 0.0),
-                tri_aniso_ke=wp.vec3(1.0e2, 1.0e2, 1.0e1),
-                edge_aniso_ke=wp.vec3(2.0e-5, 1.0e-5, 5.0e-6),
                 panel_verts=garment_mesh_uv.tolist(),
                 panel_indices=garment_mesh_uv_indices.tolist(),
-                vertices=garment_mesh_points.tolist(),
-                indices=garment_mesh_indices.tolist(),
+                vertices=garment_mesh.vertices.tolist(),
+                indices=garment_mesh.indices.tolist(),
                 density=0.3,
                 scale=1.0,
                 particle_radius=5.0e-3,
+                tri_aniso_ke=wp.vec3(1.0e2, 1.0e2, 1.0e1),
+                edge_aniso_ke=wp.vec3(2.0e-5, 1.0e-5, 5.0e-6),
             )
             builder.add_shape_mesh(
                 body=builder.add_body(),
                 xform=wp.transform(
                     p=wp.vec3(0, 0, 0),
-                    q=wp.quat_identity(),
+                    q=wp.quat_from_axis_angle(axis=wp.vec3(1, 0, 0), angle=wp.pi / 2.0),
                 ),
                 mesh=Mesh(avatar_mesh_points, avatar_mesh_indices),
             )
@@ -102,9 +89,10 @@ class Example:
             grid_dim = 100
             grid_width = 1.0
             cloth_density = 0.3
-            builder.add_aniso_cloth_grid(
+            style3d.add_cloth_grid(
+                builder,
                 pos=wp.vec3(-0.5, 0.0, 2.0),
-                rot=wp.quat_identity(),
+                rot=wp.quat_from_axis_angle(axis=wp.vec3(1, 0, 0), angle=wp.pi / 2.0),
                 dim_x=grid_dim,
                 dim_y=grid_dim,
                 cell_x=grid_width / grid_dim,
@@ -136,54 +124,30 @@ class Example:
         self.model.soft_contact_mu = 0.2
         self.model.set_gravity((0.0, 0.0, -9.81))
 
-        # Login
-        if os.path.exists("key.txt"):
-            with open("key.txt", encoding="utf-8") as f:
-                lines = f.read().splitlines()
-                username = lines[0].strip()
-                password = lines[1].strip()
-        else:
-            username = input("User Name: ")
-            password = input("Password: ")
-        sim.login(username, password, True, None)
+        sim.set_log_callback(sim_log_callback)
+        sim.login("simsdk003", "xSXiaCMd", True, None)
 
+        # self.solver = newton.solvers.SolverStyle3D(
         self.solver = SolverStyle3DPro(
             model=self.model,
             iterations=self.iterations,
         )
-        self.solver.precompute(
-            builder,
-        )
-
-        # Set style3dsim.World attribute
-        world_attrib = sim.WorldAttrib()
-        world_attrib.enable_gpu = True
-        world_attrib.time_step = self.sim_dt
-        if self.model.up_axis == newton.Axis.Z:
-            world_attrib.gravity = sim.Vec3f(0, 0, -9.8)
-            world_attrib.ground_direction = sim.Vec3f(0, 0, 1)
-        self.solver.world.set_attrib(world_attrib)
-
-        # Set style3dsim.Cloth attribute
-        cloth_attrib = sim.ClothAttrib()
-        cloth_attrib.density = 0.2
-        cloth_attrib.thickness = 6e-3
-        cloth_attrib.static_friction = 0.03
-        cloth_attrib.dynamic_friction = 0.03
-        cloth_attrib.bend_stiff = sim.Vec3f(1e-6, 1e-6, 1e-6)
-        self.solver.cloth.set_attrib(cloth_attrib)
-
-        # init states
+        # self.solver._precompute(
+        #     builder,
+        # )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.contacts = self.model.collide(self.state_0)
-        self.viewer.set_model(self.model)
 
-        self.capture()
+        self.contacts = self.model.contacts()
+
+        self.viewer.set_model(self.model)
+        self.viewer.set_camera(wp.vec3(0.0, -1.7, 1.4), 0.0, -270.0)
+
+        self.graph = None
 
     def capture(self):
-        if wp.get_device().is_cuda and False:  # style3dsim does not support stream capturing
+        if wp.get_device().is_cuda:
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph
@@ -191,7 +155,7 @@ class Example:
             self.graph = None
 
     def simulate(self):
-        self.contacts = self.model.collide(self.state_0)
+        self.model.collide(self.state_0, self.contacts)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
 
@@ -215,7 +179,7 @@ class Example:
         newton.examples.test_particle_state(
             self.state_0,
             "particles are within a reasonable volume",
-            lambda q, qd: newton.utils.vec_inside_limits(q, p_lower, p_upper),
+            lambda q, qd: newton.math.vec_inside_limits(q, p_lower, p_upper),
         )
 
     def render(self):
@@ -230,6 +194,6 @@ if __name__ == "__main__":
     viewer, args = newton.examples.init()
 
     # Create example and run
-    example = Example(viewer)
+    example = Example(viewer, args)
 
     newton.examples.run(example, args)

@@ -172,9 +172,6 @@ class Viewer:
             ps.set_ground_plane_mode(self._ground_plane_mode)
 
     def _update_gui(self):
-        # Skip generate "imgui.ini" file
-        ps.imgui.GetIO().IniFilename = None
-
         # update render fps
         curr_time = time.time()
         if (self._rendering_fps_counter > 0) and (curr_time - self._rendering_fps_last_time > 0.1):

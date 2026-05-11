@@ -7,21 +7,16 @@
 ########################################################################################################################
 
 import os
-import sys
-
-# sys.path.append("D:/Desktop/SimulatorSDK/build/lib/Debug")
-sys.path.append("D:/Desktop/SimulatorSDK/build/lib/RelWithDebInfo")
-
 from datetime import datetime
 
 import numpy as np
 import polyscope as ps
 import style3dsim as sim
 import warp as wp
-from pxr import Usd, UsdGeom
 
 import newton.examples
-from style3d import Viewer
+import newton.usd
+from style3d.viewer import ViewerNewton
 
 
 def log_callback(file_name: str, func_name: str, line: int, level: sim.LogLevel, message: str):
@@ -70,12 +65,12 @@ def generate_square_cloth_np(nx: int, ny: int, width: float, height: float):
 
 
 def LoadUsd(file_path, root_path):
-    usd_stage = Usd.Stage.Open(file_path)
-    usd_geom = UsdGeom.Mesh(usd_stage.GetPrimAtPath(root_path))
-    indices = usd_geom.GetFaceVertexIndicesAttr().Get()
-    normals = usd_geom.GetNormalsAttr().Get()
-    points = usd_geom.GetPointsAttr().Get()
-    return [indices, points, normals]
+    from pxr import Usd
+
+    stage = Usd.Stage.Open(file_path)
+    prim = stage.GetPrimAtPath(root_path)
+    mesh = newton.usd.get_mesh(prim, load_uvs=False)
+    return [mesh.indices, mesh.vertices, mesh.normals]
 
 
 if __name__ == "__main__":
@@ -94,7 +89,7 @@ if __name__ == "__main__":
     sim.login(username, password, True, None)
 
     # Create viewer
-    viewer = Viewer()
+    viewer = ViewerNewton()
 
     # Create world
     world = sim.World()

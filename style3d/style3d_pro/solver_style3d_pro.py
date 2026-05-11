@@ -12,7 +12,11 @@ import warp as wp
 
 import newton
 import newton as nt
-from newton import Contacts, Control, State, Style3DModelBuilder
+from newton import Contacts, Control, State
+
+########################################################################################################################
+################################################    SolverStyle3DPro    ################################################
+########################################################################################################################
 
 
 def sim_log_callback(file_name: str, func_name: str, line: int, level: sim.LogLevel, message: str):
@@ -29,7 +33,7 @@ def sim_log_callback(file_name: str, func_name: str, line: int, level: sim.LogLe
 class SolverStyle3DPro(nt.solvers.SolverBase):
     def __init__(
         self,
-        model: nt.Style3DModel,
+        model: nt.Model,
         iterations=10,
         linear_iterations=10,
         drag_spring_stiff: float = 1e2,
@@ -72,10 +76,10 @@ class SolverStyle3DPro(nt.solvers.SolverBase):
                     @wp.kernel
                     def transform_vertices_kernel(
                         index: wp.int32,
-                        vertices_in: wp.array(dtype=wp.vec3),
-                        scaling3d: wp.array(dtype=wp.vec3),
-                        transforms: wp.array(dtype=wp.transform),
-                        vertices_out: wp.array(dtype=wp.vec3),
+                        vertices_in: wp.array[wp.vec3],
+                        scaling3d: wp.array[wp.vec3],
+                        transforms: wp.array[wp.transform],
+                        vertices_out: wp.array[wp.vec3],
                     ):
                         tid = wp.tid()
                         new_pos = wp.transform_point(transforms[index], vertices_in[tid])
@@ -110,7 +114,7 @@ class SolverStyle3DPro(nt.solvers.SolverBase):
                     attrib = sim.RigidBodyAttrib()
                     attrib.mass = 10.0
                     rigid_body.set_attrib(attrib)
-                    self.body_entities[model.shape_key[shape_idx]] = rigid_body
+                    self.body_entities[model.shape_label[shape_idx]] = rigid_body
 
         # Drag info
         self.drag_pos = wp.zeros(1, dtype=wp.vec3, device=self.device)
@@ -137,7 +141,7 @@ class SolverStyle3DPro(nt.solvers.SolverBase):
                             rotation_1 = sim.Quat(trans_1[3], trans_1[4], trans_1[5], trans_1[6])
                             begin_trans = sim.Transform(translation_0, rotation_0, sim.Vec3f(1.0, 1.0, 1.0))
                             end_trans = sim.Transform(translation_1, rotation_1, sim.Vec3f(1.0, 1.0, 1.0))
-                            self.body_entities[self.model.shape_key[shape_idx]].move(begin_trans, end_trans)
+                            self.body_entities[self.model.shape_label[shape_idx]].move(begin_trans, end_trans)
 
         self.world.step_sim()
         self.world.fetch_sim(0)

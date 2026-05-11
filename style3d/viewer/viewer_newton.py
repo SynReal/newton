@@ -12,6 +12,7 @@ import polyscope.imgui
 import warp as wp
 from typing_extensions import override
 
+import newton
 from newton import Axis, AxisType, Mesh, State
 from newton._src.viewer.viewer import ViewerBase
 from style3d.viewer.viewer import Viewer
@@ -141,10 +142,10 @@ class ViewerNewton(Viewer, ViewerBase):
                         def transform_vertices_kernel(
                             index: wp.int32,
                             scale: float,
-                            vertices_in: wp.array(dtype=wp.vec3),
-                            scaling3d: wp.array(dtype=wp.vec3),
-                            transforms: wp.array(dtype=wp.transform),
-                            vertices_out: wp.array(dtype=wp.vec3),
+                            vertices_in: wp.array[wp.vec3],
+                            scaling3d: wp.array[wp.vec3],
+                            transforms: wp.array[wp.transform],
+                            vertices_out: wp.array[wp.vec3],
                         ):
                             tid = wp.tid()
                             scaling = scaling3d[index] * scale
@@ -169,8 +170,8 @@ class ViewerNewton(Viewer, ViewerBase):
                             outputs=[shape_vertices],
                         )
 
-                        self.body_entities[model.shape_key[shape_idx]] = ps.register_surface_mesh(
-                            name=model.shape_key[shape_idx],
+                        self.body_entities[model.shape_label[shape_idx]] = ps.register_surface_mesh(
+                            name=model.shape_label[shape_idx],
                             vertices=shape_vertices.numpy(),
                             faces=model.shape_source[shape_idx].indices.reshape(-1, 3),
                             back_face_policy="cull",
@@ -218,8 +219,8 @@ class ViewerNewton(Viewer, ViewerBase):
             @wp.kernel
             def transform_to_mat4x4_kernel(
                 scale: float,
-                transform_in: wp.array(dtype=wp.transform),
-                transform_out: wp.array(dtype=wp.mat44),
+                transform_in: wp.array[wp.transform],
+                transform_out: wp.array[wp.mat44],
             ):
                 tid = wp.tid()
                 transform = transform_in[tid]
@@ -241,7 +242,7 @@ class ViewerNewton(Viewer, ViewerBase):
                 for shape_idx in shape_indices:
                     if isinstance(self.model.shape_source[shape_idx], Mesh):
                         if self.shape_flags[shape_idx] & 1:
-                            self.body_entities[self.model.shape_key[shape_idx]].set_transform(
+                            self.body_entities[self.model.shape_label[shape_idx]].set_transform(
                                 self._transform_to_y_up(body_q[i])
                             )
 
@@ -274,6 +275,52 @@ class ViewerNewton(Viewer, ViewerBase):
         super().end_frame()
         self.frame_tick()
 
+    @override
+    def apply_forces(self, state: newton.State):
+        pass
+
+    @override
+    def log_array(self, name: str, array):
+        pass
+
+    @override
+    def log_instances(self, name, mesh, xforms, scales, colors, materials, hidden=False):
+        pass
+
+    @override
+    def log_lines(self, name, starts, ends, colors, width=0.01, hidden=False):
+        pass
+
+    @override
+    def log_mesh(
+        self,
+        name,
+        points,
+        indices,
+        normals=None,
+        uvs=None,
+        texture=None,
+        hidden=False,
+        backface_culling=True,
+    ):
+        pass
+
+    @override
+    def log_points(self, name, points, radii=None, colors=None, hidden=False):
+        pass
+
+    @override
+    def log_scalar(self, name, value, *, clear=False, smoothing=1):
+        pass
+
+    @override
+    def close(self):
+        pass
+
+
+########################################################################################################################
+####################################################    __main__    ####################################################
+########################################################################################################################
 
 if __name__ == "__main__":
     viewer = ViewerNewton()
