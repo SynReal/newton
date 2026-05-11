@@ -209,38 +209,6 @@ Directly invokes the `synreal-sim` SDK to simulate cloth and rigid bodies togeth
 python style3d/examples/example_sim3dsim.py
 ```
 
-## Repository Layout (style3d additions)
-
-```
-style3d/
-├── __init__.py
-├── simulation_login_template.json   # Login config template
-├── style3d_mini/                    # Lightweight Style3D solver wrapper
-│   └── style3d_mini.py
-├── style3d_pro/                     # SolverStyle3DPro
-│   ├── __init__.py
-│   └── solver_style3d_pro.py
-├── viewer/                          # Polyscope-based viewer
-│   ├── __init__.py
-│   ├── viewer.py                    # General-purpose Viewer base class
-│   └── viewer_newton.py             # Newton-integrated Viewer
-└── examples/                        # Branch-specific example scripts
-    ├── example_style3d.py
-    ├── example_style3d_pro.py
-    ├── example_hand_push_cloth.py
-    ├── example_sim3dsim.py
-    ├── push_cloth_wonik_allegro/
-    └── push_cloth_zjrx/
-```
-
-## Contributing and Development
-
-See the [contribution guidelines](https://github.com/newton-physics/newton-governance/blob/main/CONTRIBUTING.md) and the [development guide](https://newton-physics.github.io/newton/latest/guide/development.html) for instructions on how to contribute to Newton.
-
-## Support and Community Discussion
-
-For questions, please consult the [Newton documentation](https://newton-physics.github.io/newton/latest/guide/overview.html) first before creating [a discussion in the main repository](https://github.com/newton-physics/newton/discussions).
-
 ## Code of Conduct
 
 By participating in this community, you agree to abide by the Linux Foundation [Code of Conduct](https://lfprojects.org/policies/code-of-conduct/).
