@@ -7,7 +7,7 @@
 ########################################################################################################################
 
 import numpy as np
-import style3dsim as sim
+import synreal_sim as sim
 import warp as wp
 
 import newton

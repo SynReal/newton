@@ -4,9 +4,9 @@
 
 This repository is a fork of [newton-physics/newton](https://github.com/newton-physics/newton), maintained by [Style3D (Zhejiang Linctex Digital Technology)](https://www.style3d.com/). The `style3d` branch extends the upstream Newton codebase with:
 
-- **`SolverStyle3DPro`** — A high-fidelity cloth solver built on the Style3D simulation SDK (`style3dsim`), supporting anisotropic material models, garment–avatar collision, and GPU-accelerated solving.
+- **`SolverStyle3DPro`** — A high-fidelity cloth solver built on the SynReal simulation SDK (`synreal-sim`), supporting anisotropic material models, garment–avatar collision, and GPU-accelerated solving.
 - **Polyscope Viewer** — An interactive 3D viewer based on [Polyscope](https://polyscope.run/), supporting real-time cloth rendering and mouse-drag interaction.
-- **Style3D simulation examples** — Covering garment-on-avatar simulation, robot hand–cloth interaction, and direct `style3dsim` SDK usage.
+- **SynReal simulation examples** — Covering garment-on-avatar simulation, robot hand–cloth interaction, and direct `synreal-sim` SDK usage.
 
 The upstream Newton cloth solver (`SolverStyle3D`) and all existing Style3D-related examples (e.g., `cloth_style3d`, `cloth_h1`) from the main branch are retained in this fork.
 
@@ -40,7 +40,7 @@ The upstream Newton cloth solver (`SolverStyle3D`) and all existing Style3D-rela
 - **Python** 3.10+
 - **OS:** Linux (x86-64, aarch64) or Windows (x86-64)
 - **GPU:** NVIDIA GPU (Maxwell or newer), driver 545 or newer (CUDA 12)
-- **style3dsim:** Style3D simulation SDK (requires a license — contact Style3D to obtain access)
+- **synreal-sim:** SynReal simulation SDK (requires a license — contact us at [SynReal](https://github.com/SynReal) to obtain access)
 - **polyscope:** `pip install polyscope`
 
 ## Quickstart
@@ -63,7 +63,7 @@ python style3d/examples/example_style3d_pro.py
 
 ### Overview
 
-`SolverStyle3DPro` is a Newton solver extension that wraps the Style3D commercial simulation engine (`style3dsim`), providing industrial-grade cloth simulation:
+`SolverStyle3DPro` is a Newton solver extension that wraps the SynReal commercial simulation engine (`synreal-sim`), providing industrial-grade cloth simulation:
 
 - Anisotropic elastic model (`tri_aniso_ke`, `edge_aniso_ke`)
 - Cloth–rigid-body collision detection (garment on avatar)
@@ -104,7 +104,7 @@ for _ in range(num_steps):
 `SolverStyle3DPro` requires Style3D SDK authorization before running:
 
 ```python
-import style3dsim as sim
+import synreal_sim as sim
 
 # Option 1: interactive prompt
 sim.login(username, password, True, None)
@@ -203,7 +203,7 @@ python style3d/examples/example_hand_push_cloth.py
 
 [`style3d/examples/example_sim3dsim.py`](style3d/examples/example_sim3dsim.py)
 
-Directly invokes the `style3dsim` SDK to simulate cloth and rigid bodies together, rendered via the Polyscope `Viewer`.
+Directly invokes the `synreal-sim` SDK to simulate cloth and rigid bodies together, rendered via the Polyscope `Viewer`.
 
 ```bash
 python style3d/examples/example_sim3dsim.py

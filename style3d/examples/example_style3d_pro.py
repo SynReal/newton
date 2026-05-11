@@ -16,7 +16,7 @@
 import os
 
 import numpy as np
-import style3dsim as sim
+import synreal_sim as sim
 import warp as wp
 from pxr import Usd, UsdGeom
 
@@ -155,7 +155,7 @@ class Example:
             builder,
         )
 
-        # Set style3dsim.World attribute
+        # Set synreal_sim.World attribute
         world_attrib = sim.WorldAttrib()
         world_attrib.enable_gpu = True
         world_attrib.time_step = self.sim_dt
@@ -164,7 +164,7 @@ class Example:
             world_attrib.ground_direction = sim.Vec3f(0, 0, 1)
         self.solver.world.set_attrib(world_attrib)
 
-        # Set style3dsim.Cloth attribute
+        # Set synreal_sim.Cloth attribute
         cloth_attrib = sim.ClothAttrib()
         cloth_attrib.density = 0.2
         cloth_attrib.thickness = 6e-3
@@ -183,7 +183,7 @@ class Example:
         self.capture()
 
     def capture(self):
-        if wp.get_device().is_cuda and False:  # style3dsim does not support stream capturing
+        if wp.get_device().is_cuda and False:  # synreal-sim does not support stream capturing
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph

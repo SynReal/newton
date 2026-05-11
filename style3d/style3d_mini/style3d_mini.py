@@ -4,7 +4,7 @@ import newton
 from newton import Contacts, Control, State
 import warp as wp
 from pxr import Usd,UsdGeom
-import style3dsim as sim
+import synreal_sim as sim
 import numpy as np
 import json
 import os

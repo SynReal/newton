@@ -16,7 +16,7 @@ from datetime import datetime
 
 import numpy as np
 import polyscope as ps
-import style3dsim as sim
+import synreal_sim as sim
 import warp as wp
 from pxr import Usd, UsdGeom
 
