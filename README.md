@@ -209,10 +209,3 @@ Directly invokes the `synreal-sim` SDK to simulate cloth and rigid bodies togeth
 python style3d/examples/example_sim3dsim.py
 ```
 
-## Code of Conduct
-
-By participating in this community, you agree to abide by the Linux Foundation [Code of Conduct](https://lfprojects.org/policies/code-of-conduct/).
-
-## Project Governance, Legal, and Members
-
-Please see the [newton-governance repository](https://github.com/newton-physics/newton-governance) for more information about project governance.
