@@ -8,7 +8,7 @@ This repository is a fork of [newton-physics/newton](https://github.com/newton-p
 - **Polyscope Viewer** — An interactive 3D viewer based on [Polyscope](https://polyscope.run/), supporting real-time cloth rendering and mouse-drag interaction.
 - **SynReal simulation examples** — Covering garment-on-avatar simulation, robot hand–cloth interaction, and direct `synreal-sim` SDK usage.
 
-The upstream Newton cloth solver (`SolverStyle3D`) and all existing Style3D-related examples (e.g., `cloth_style3d`, `cloth_h1`) from the main branch are retained in this fork.
+## Basic Examples
 
 <table>
   <tr>
@@ -136,15 +136,6 @@ import newton
 viewer = ViewerNewton(up_axis=newton.Axis.Z)
 viewer.render(example)  # calls step() each frame and refreshes rendering
 ```
-
-### Features
-
-- **Real-time cloth rendering:** Triangle mesh with per-frame vertex updates
-- **Rigid body rendering:** Multiple bodies with live transform updates
-- **Particle rendering:** Point-cloud display
-- **Mouse drag:** Cloth picking and dragging via the Polyscope pick interface
-- **Pause / resume:** ImGui control panel
-- **FPS counter:** Live frame-rate display
 
 ## Examples
 
