@@ -1,6 +1,6 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-# Newton — Style3D Branch
+# SynReal - Newton
 
 This repository is a fork of [newton-physics/newton](https://github.com/newton-physics/newton), maintained by [Style3D (Zhejiang Linctex Digital Technology)](https://www.style3d.com/). The `style3d` branch extends the upstream Newton codebase with:
 
@@ -9,6 +9,31 @@ This repository is a fork of [newton-physics/newton](https://github.com/newton-p
 - **Style3D simulation examples** — Covering garment-on-avatar simulation, robot hand–cloth interaction, and direct `style3dsim` SDK usage.
 
 The upstream Newton cloth solver (`SolverStyle3D`) and all existing Style3D-related examples (e.g., `cloth_style3d`, `cloth_h1`) from the main branch are retained in this fork.
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_cloth_style3d.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cloth_style3d.jpg" alt="Cloth Style3D">
+      </a>
+    </td>
+    <td align="center" width="50%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_cloth_h1.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cloth_h1.jpg" alt="Cloth H1">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <code>python -m newton.examples cloth_style3d</code><br>
+      Anisotropic garment on a static avatar using <code>SolverStyle3D</code>.
+    </td>
+    <td align="center">
+      <code>python -m newton.examples cloth_h1</code><br>
+      H1 robot in a jacket, driven by IK — cloth powered by <code>SolverStyle3D</code>.
+    </td>
+  </tr>
+</table>
 
 ## Requirements
 
@@ -127,30 +152,8 @@ viewer.render(example)  # calls step() each frame and refreshes rendering
 
 These examples ship in the upstream Newton codebase and are retained in this fork. They use the `SolverStyle3D` solver that is part of Newton core.
 
-<table>
-  <tr>
-    <td align="center" width="50%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_cloth_style3d.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cloth_style3d.jpg" alt="Cloth Style3D">
-      </a>
-    </td>
-    <td align="center" width="50%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_cloth_h1.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cloth_h1.jpg" alt="Cloth H1">
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center">
-      <code>python -m newton.examples cloth_style3d</code><br>
-      Anisotropic garment on a static avatar using <code>SolverStyle3D</code>.
-    </td>
-    <td align="center">
-      <code>python -m newton.examples cloth_h1</code><br>
-      H1 robot in a jacket, driven by IK — cloth powered by <code>SolverStyle3D</code>.
-    </td>
-  </tr>
-</table>
+- `python -m newton.examples cloth_style3d` — Anisotropic garment on a static avatar using `SolverStyle3D`.
+- `python -m newton.examples cloth_h1` — H1 robot in a jacket, driven by IK — cloth powered by `SolverStyle3D`.
 
 ### Style3D Branch Examples
 
