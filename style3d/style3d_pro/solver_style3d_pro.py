@@ -151,7 +151,7 @@ class SolverStyle3DPro(nt.solvers.SolverBase):
     def rebuild_bvh(self, state: State):
         pass
 
-    def precompute(self, builder: Style3DModelBuilder):
+    def precompute(self, builder: nt.ModelBuilder):
         pass
 
     def update_drag_info(self, index: int, pos: wp.vec3, bary_coord: wp.vec3):

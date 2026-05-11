@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 import style3dsim as sim
 import warp as wp
 
@@ -124,8 +126,19 @@ class Example:
         self.model.soft_contact_mu = 0.2
         self.model.set_gravity((0.0, 0.0, -9.81))
 
+        # Set log callback
         sim.set_log_callback(sim_log_callback)
-        sim.login("simsdk003", "xSXiaCMd", True, None)
+
+        # Login
+        if os.path.exists("key.txt"):
+            with open("key.txt", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+                username = lines[0].strip()
+                password = lines[1].strip()
+        else:
+            username = input("User Name: ")
+            password = input("Password: ")
+        sim.login(username, password, True, None)
 
         # self.solver = newton.solvers.SolverStyle3D(
         self.solver = SolverStyle3DPro(
