@@ -1,797 +1,207 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-![GitHub commit activity](https://img.shields.io/github/commit-activity/m/newton-physics/newton/main)
-[![codecov](https://codecov.io/gh/newton-physics/newton/graph/badge.svg?token=V6ZXNPAWVG)](https://codecov.io/gh/newton-physics/newton)
-[![Push - AWS GPU](https://github.com/newton-physics/newton/actions/workflows/push_aws_gpu.yml/badge.svg)](https://github.com/newton-physics/newton/actions/workflows/push_aws_gpu.yml)
 
-# Newton
+# Newton — Style3D 分支
 
-Newton is a GPU-accelerated physics simulation engine built upon [NVIDIA Warp](https://github.com/NVIDIA/warp), specifically targeting roboticists and simulation researchers.
+Newton 是基于 [NVIDIA Warp](https://github.com/NVIDIA/warp) 构建的 GPU 加速物理仿真引擎，专注于机器人研究与仿真应用。
 
-Newton extends and generalizes Warp's ([deprecated](https://github.com/NVIDIA/warp/discussions/735)) `warp.sim` module, and integrates
-[MuJoCo Warp](https://github.com/google-deepmind/mujoco_warp) as its primary backend. Newton emphasizes GPU-based computation, [OpenUSD](https://openusd.org/) support, differentiability, and user-defined extensibility, facilitating rapid iteration and scalable robotics simulation.
+本分支（`style3d`）由 [浙江凌迪数字科技（Style3D）](https://www.style3d.com/) 维护，在 Newton 主线的基础上集成了以下扩展：
 
-Newton is a [Linux Foundation](https://www.linuxfoundation.org/) project that is community-built and maintained. Code is licensed under [Apache-2.0](https://github.com/newton-physics/newton/blob/main/LICENSE.md). Documentation is licensed under [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/). Additional and third-party license texts are available in [`newton/licenses`](https://github.com/newton-physics/newton/tree/main/newton/licenses).
+- **`SolverStyle3DPro`** — 基于 Style3D 仿真 SDK（`style3dsim`）的高保真布料求解器，支持各向异性材质、服装-人体交互及 GPU 加速；
+- **Polyscope Viewer** — 基于 [Polyscope](https://polyscope.run/) 的交互式 3D 可视化工具，支持实时布料渲染与鼠标拖拽交互；
+- **Style3D 仿真示例** — 覆盖服装穿着仿真、手推布料、3D-Sim 联合仿真等场景。
 
-Newton was initiated by [Disney Research](https://www.disneyresearch.com/), [Google DeepMind](https://deepmind.google/), and [NVIDIA](https://www.nvidia.com/).
-
-## Requirements
+## 依赖要求
 
 - **Python** 3.10+
-- **OS:** Linux (x86-64, aarch64), Windows (x86-64), or macOS (CPU only)
-- **GPU:** NVIDIA GPU (Maxwell or newer), driver 545 or newer (CUDA 12). No local CUDA Toolkit installation required. macOS runs on CPU.
+- **OS：** Linux (x86-64、aarch64) 或 Windows (x86-64)
+- **GPU：** NVIDIA GPU（Maxwell 及以上），驱动版本 ≥ 545（CUDA 12）
+- **style3dsim：** Style3D 仿真 SDK（需向 Style3D 申请授权，须登录后使用）
+- **polyscope：** `pip install polyscope`
 
-For detailed system requirements and tested configurations, see the [installation guide](https://newton-physics.github.io/newton/latest/guide/installation.html).
-
-## Quickstart
+## 快速开始
 
 ```bash
+# 克隆仓库并切换到 style3d 分支
+git clone https://github.com/SynReal/newton.git
+cd newton
+git checkout style3d
+
+# 安装依赖
 pip install "newton[examples]"
-python -m newton.examples
+pip install polyscope
+
+# 运行 Style3D Pro 布料仿真示例
+python style3d/examples/example_style3d_pro.py
 ```
 
-To install from source with [uv](https://docs.astral.sh/uv/), see the [installation guide](https://newton-physics.github.io/newton/latest/guide/installation.html).
+## Style3D Pro 求解器
 
-## Examples
+### 简介
 
-Before running the examples below, install Newton with the examples extra:
+`SolverStyle3DPro` 是 Newton 的扩展求解器，封装了 Style3D 商业仿真引擎（`style3dsim`），提供工业级布料仿真能力：
 
-```bash
-pip install "newton[examples]"
+- 支持各向异性弹性模型（`tri_aniso_ke`、`edge_aniso_ke`）
+- 支持服装与刚体（人体模型）之间的碰撞检测
+- 支持 GPU 加速求解（需在 `WorldAttrib` 中开启 `enable_gpu = True`）
+- 支持鼠标拖拽交互（`enable_mouse_dragging=True`）
+- 需要通过 `sim.login()` 进行 Style3D SDK 授权登录
+
+### 基本用法
+
+```python
+import newton
+import warp as wp
+from style3d.style3d_pro import SolverStyle3DPro
+from style3d.viewer.viewer_newton import ViewerNewton
+
+# 构建模型
+builder = newton.Style3DModelBuilder(up_axis=newton.Axis.Z)
+# ... 添加布料网格、刚体等 ...
+model = builder.finalize()
+
+# 创建求解器
+solver = SolverStyle3DPro(
+    model=model,
+    iterations=4,
+    enable_mouse_dragging=True,
+)
+solver.precompute(builder)
+
+# 仿真循环
+state_0 = model.state()
+state_1 = model.state()
+for _ in range(num_steps):
+    solver.step(state_0, state_1, control, contacts, dt)
+    state_0, state_1 = state_1, state_0
 ```
 
-If you installed from source with uv, substitute `uv run` for `python` in the commands below.
+### 授权登录
 
-<table>
-  <tr>
-    <td colspan="3"><h3>Basic Examples</h3></td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/basic/example_basic_pendulum.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_basic_pendulum.jpg" alt="Pendulum">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/basic/example_basic_urdf.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_basic_urdf.jpg" alt="URDF">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/basic/example_basic_viewer.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_basic_viewer.jpg" alt="Viewer">
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples basic_pendulum</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples basic_urdf</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples basic_viewer</code>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/basic/example_basic_shapes.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_basic_shapes.jpg" alt="Shapes">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/basic/example_basic_joints.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_basic_joints.jpg" alt="Joints">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/basic/example_basic_conveyor.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_basic_conveyor.jpg" alt="Conveyor">
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples basic_shapes</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples basic_joints</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples basic_conveyor</code>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/basic/example_basic_heightfield.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_basic_heightfield.jpg" alt="Heightfield">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/basic/example_recording.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_recording.jpg" alt="Recording">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/basic/example_replay_viewer.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_replay_viewer.jpg" alt="Replay Viewer">
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples basic_heightfield</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples recording</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples replay_viewer</code>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/basic/example_basic_plotting.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_basic_plotting.jpg" alt="Plotting">
-      </a>
-    </td>
-    <td></td>
-    <td></td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples basic_plotting</code>
-    </td>
-    <td></td>
-    <td></td>
-  </tr>
-  <tr>
-    <td colspan="3"><h3>Robot Examples</h3></td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/robot/example_robot_cartpole.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_robot_cartpole.jpg" alt="Cartpole">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/robot/example_robot_g1.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_robot_g1.jpg" alt="G1">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/robot/example_robot_h1.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_robot_h1.jpg" alt="H1">
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples robot_cartpole</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples robot_g1</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples robot_h1</code>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/robot/example_robot_anymal_d.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_robot_anymal_d.jpg" alt="Anymal D">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/robot/example_robot_anymal_c_walk.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_robot_anymal_c_walk.jpg" alt="Anymal C Walk">
-      </a>
-    </td>
-    <td></td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples robot_anymal_d</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples robot_anymal_c_walk</code>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/robot/example_robot_policy.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_robot_policy.jpg" alt="Policy">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/robot/example_robot_ur10.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_robot_ur10.jpg" alt="UR10">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/robot/example_robot_panda_hydro.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_robot_panda_hydro.jpg" alt="Panda Hydro">
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples robot_policy</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples robot_ur10</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples robot_panda_hydro</code>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/robot/example_robot_allegro_hand.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_robot_allegro_hand.jpg" alt="Allegro Hand">
-      </a>
-    </td>
-    <td align="center" width="33%">
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples robot_allegro_hand</code>
-    </td>
-    <td align="center" width="33%">
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td colspan="3"><h3>Cable Examples</h3></td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cable/example_cable_twist.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cable_twist.jpg" alt="Cable Twist">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cable/example_cable_y_junction.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cable_y_junction.jpg" alt="Cable Y-Junction">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cable/example_cable_bundle_hysteresis.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cable_bundle_hysteresis.jpg" alt="Cable Bundle Hysteresis">
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples cable_twist</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples cable_y_junction</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples cable_bundle_hysteresis</code>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cable/example_cable_pile.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cable_pile.jpg" alt="Cable Pile">
-      </a>
-    </td>
-    <td align="center" width="33%">
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples cable_pile</code>
-    </td>
-    <td align="center" width="33%">
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td colspan="3"><h3>Cloth Examples</h3></td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_cloth_bending.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cloth_bending.jpg" alt="Cloth Bending">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_cloth_hanging.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cloth_hanging.jpg" alt="Cloth Hanging">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_cloth_style3d.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cloth_style3d.jpg" alt="Cloth Style3D">
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples cloth_bending</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples cloth_hanging</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples cloth_style3d</code>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_cloth_h1.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cloth_h1.jpg" alt="Cloth H1">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_cloth_twist.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cloth_twist.jpg" alt="Cloth Twist">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_cloth_franka.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cloth_franka.jpg" alt="Cloth Franka">
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples cloth_h1</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples cloth_twist</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples cloth_franka</code>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_cloth_rollers.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cloth_rollers.jpg" alt="Cloth Rollers">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_cloth_poker_cards.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cloth_poker_cards.jpg" alt="Cloth Poker Cards">
-      </a>
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples cloth_rollers</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples cloth_poker_cards</code>
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td colspan="3"><h3>Inverse Kinematics Examples</h3></td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/ik/example_ik_franka.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_ik_franka.jpg" alt="IK Franka">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/ik/example_ik_h1.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_ik_h1.jpg" alt="IK H1">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/ik/example_ik_custom.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_ik_custom.jpg" alt="IK Custom">
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples ik_franka</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples ik_h1</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples ik_custom</code>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/ik/example_ik_cube_stacking.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_ik_cube_stacking.jpg" alt="IK Cube Stacking">
-      </a>
-    </td>
-    <td align="center" width="33%">
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples ik_cube_stacking</code>
-    </td>
-    <td align="center" width="33%">
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td colspan="3"><h3>MPM Examples</h3></td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/mpm/example_mpm_granular.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_mpm_granular.jpg" alt="MPM Granular">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/mpm/example_mpm_anymal.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_mpm_anymal.jpg" alt="MPM Anymal">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/mpm/example_mpm_twoway_coupling.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_mpm_twoway_coupling.jpg" alt="MPM Two-Way Coupling">
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples mpm_granular</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples mpm_anymal</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples mpm_twoway_coupling</code>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/mpm/example_mpm_grain_rendering.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_mpm_grain_rendering.jpg" alt="MPM Grain Rendering">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/mpm/example_mpm_multi_material.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_mpm_multi_material.jpg" alt="MPM Multi Material">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/mpm/example_mpm_viscous.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_mpm_viscous.jpg" alt="MPM Viscous">
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples mpm_grain_rendering</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples mpm_multi_material</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples mpm_viscous</code>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/mpm/example_mpm_beam_twist.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_mpm_beam_twist.jpg" alt="MPM Beam Twist">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/mpm/example_mpm_snow_ball.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_mpm_snow_ball.jpg" alt="MPM Snow Ball">
-      </a>
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples mpm_beam_twist</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples mpm_snow_ball</code>
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td colspan="3"><h3>Sensor Examples</h3></td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/sensors/example_sensor_contact.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_sensor_contact.jpg" alt="Sensor Contact">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/sensors/example_sensor_tiled_camera.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_sensor_tiled_camera.jpg" alt="Sensor Tiled Camera">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/sensors/example_sensor_imu.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_sensor_imu.jpg" alt="Sensor IMU">
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples sensor_contact</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples sensor_tiled_camera</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples sensor_imu</code>
-    </td>
-  </tr>
-  <tr>
-    <td colspan="3"><h3>Selection Examples</h3></td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/selection/example_selection_cartpole.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_selection_cartpole.jpg" alt="Selection Cartpole">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/selection/example_selection_materials.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_selection_materials.jpg" alt="Selection Materials">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/selection/example_selection_articulations.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_selection_articulations.jpg" alt="Selection Articulations">
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples selection_cartpole</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples selection_materials</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples selection_articulations</code>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/selection/example_selection_multiple.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_selection_multiple.jpg" alt="Selection Multiple">
-      </a>
-    </td>
-    <td align="center" width="33%">
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples selection_multiple</code>
-    </td>
-    <td align="center" width="33%">
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td colspan="3"><h3>DiffSim Examples</h3></td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/diffsim/example_diffsim_ball.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_diffsim_ball.jpg" alt="DiffSim Ball">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/diffsim/example_diffsim_cloth.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_diffsim_cloth.jpg" alt="DiffSim Cloth">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/diffsim/example_diffsim_drone.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_diffsim_drone.jpg" alt="DiffSim Drone">
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples diffsim_ball</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples diffsim_cloth</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples diffsim_drone</code>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/diffsim/example_diffsim_spring_cage.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_diffsim_spring_cage.jpg" alt="DiffSim Spring Cage">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/diffsim/example_diffsim_soft_body.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_diffsim_soft_body.jpg" alt="DiffSim Soft Body">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/diffsim/example_diffsim_bear.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_diffsim_bear.jpg" alt="DiffSim Quadruped">
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples diffsim_spring_cage</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples diffsim_soft_body</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples diffsim_bear</code>
-    </td>
-  </tr>
-  <tr>
-    <td colspan="3"><h3>Multi-Physics Examples</h3></td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/multiphysics/example_softbody_gift.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_softbody_gift.jpg" alt="Softbody Gift">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/multiphysics/example_softbody_dropping_to_cloth.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_softbody_dropping_to_cloth.jpg" alt="Softbody Dropping to Cloth">
-      </a>
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples softbody_gift</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples softbody_dropping_to_cloth</code>
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td colspan="3"><h3>Contacts Examples</h3></td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/contacts/example_nut_bolt_hydro.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_nut_bolt_hydro.jpg" alt="Nut Bolt Hydro">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/contacts/example_nut_bolt_sdf.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_nut_bolt_sdf.jpg" alt="Nut Bolt SDF">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/contacts/example_brick_stacking.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_brick_stacking.jpg" alt="Brick Stacking">
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples nut_bolt_hydro</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples nut_bolt_sdf</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples brick_stacking</code>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/contacts/example_pyramid.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_pyramid.jpg" alt="Pyramid">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/contacts/example_contacts_rj45_plug.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_contacts_rj45_plug.jpg" alt="RJ45 Plug">
-      </a>
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples pyramid</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples contacts_rj45_plug</code>
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td colspan="3"><h3>Softbody Examples</h3></td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/softbody/example_softbody_hanging.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_softbody_hanging.jpg" alt="Softbody Hanging">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/softbody/example_softbody_franka.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_softbody_franka.jpg" alt="Softbody Franka">
-      </a>
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples softbody_hanging</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples softbody_franka</code>
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-</table>
+`SolverStyle3DPro` 依赖 Style3D SDK 授权，运行前需要登录：
 
-### Example Options
+```python
+import style3dsim as sim
 
-The examples support the following command-line arguments:
+# 方式一：交互式输入
+sim.login(username, password, True, None)
 
-| Argument        | Description                                                                                         | Default                      |
-| --------------- | --------------------------------------------------------------------------------------------------- | ---------------------------- |
-| `--viewer`      | Viewer type: `gl` (OpenGL window), `usd` (USD file output), `rerun` (ReRun), or `null` (no viewer). | `gl`                         |
-| `--device`      | Compute device to use, e.g., `cpu`, `cuda:0`, etc.                                                  | `None` (default Warp device) |
-| `--num-frames`  | Number of frames to simulate (for USD output).                                                      | `100`                        |
-| `--output-path` | Output path for USD files (required if `--viewer usd` is used).                                     | `None`                       |
+# 方式二：从配置文件读取（推荐）
+import json
+with open("simulation_login.json") as f:
+    cred = json.load(f)
+sim.login(cred["name"], cred["pass_word"], True, None)
+```
 
-Some examples may add additional arguments (see their respective source files for details).
+`simulation_login.json` 格式参考 [`style3d/simulation_login_template.json`](style3d/simulation_login_template.json)。
 
-### Example Usage
+## Polyscope Viewer
+
+### 简介
+
+本分支提供了两个基于 [Polyscope](https://polyscope.run/) 的可视化类：
+
+| 类名 | 文件 | 说明 |
+|------|------|------|
+| `Viewer` | `style3d/viewer/viewer.py` | 通用 Polyscope 渲染器，支持布料网格、刚体、粒子的实时渲染 |
+| `ViewerNewton` | `style3d/viewer/viewer_newton.py` | 继承自 `Viewer` 和 Newton `ViewerBase`，与 Newton 仿真循环无缝集成 |
+
+### 基本用法
+
+```python
+from style3d.viewer.viewer_newton import ViewerNewton
+import newton
+
+viewer = ViewerNewton(up_axis=newton.Axis.Z)
+
+# 绑定仿真回调，viewer 会在每帧调用 step 并刷新渲染
+viewer.render(example)
+```
+
+### 功能特性
+
+- **实时布料渲染：** 三角面网格，支持逐帧更新顶点位置
+- **刚体渲染：** 支持多刚体、变换矩阵实时更新
+- **粒子渲染：** 支持粒子点云显示
+- **鼠标拖拽：** 通过 Polyscope 拾取接口实现布料拖拽交互
+- **暂停/继续：** ImGui UI 面板控制仿真播放
+- **FPS 统计：** 实时帧率显示
+
+## 示例
+
+示例代码位于 [`style3d/examples/`](style3d/examples/)。
+
+### Style3D（基础布料仿真）
+
+[`style3d/examples/example_style3d.py`](style3d/examples/example_style3d.py)
+
+使用 Newton 内置求解器（`SolverStyle3D`）加载服装与人体 USD 资产，进行各向异性布料仿真，通过 `ViewerNewton` 实时渲染。
 
 ```bash
-# List available examples
-python -m newton.examples --list
+python style3d/examples/example_style3d.py
+```
 
-# Run with the USD viewer and save to my_output.usd
-python -m newton.examples basic_viewer --viewer usd --output-path my_output.usd
+### Style3D Pro（高保真布料仿真）
 
-# Run on a selected device
-python -m newton.examples basic_urdf --device cuda:0
+[`style3d/examples/example_style3d_pro.py`](style3d/examples/example_style3d_pro.py)
 
-# Combine options
-python -m newton.examples basic_viewer --viewer gl --num-frames 500 --device cpu
+使用 `SolverStyle3DPro` 驱动 Style3D 商业求解引擎，加载女性上衣 USD 资产进行仿真，支持 GPU 加速与鼠标拖拽交互。运行前需完成 Style3D SDK 授权登录。
+
+```bash
+python style3d/examples/example_style3d_pro.py
+```
+
+**主要参数说明：**
+
+| 参数 | 说明 |
+|------|------|
+| `tri_aniso_ke` | 三角形各向异性刚度（warp/weft/shear） |
+| `edge_aniso_ke` | 弯曲各向异性刚度 |
+| `density` | 布料面密度（kg/m²） |
+| `soft_contact_ke` | 布料-刚体接触刚度 |
+| `enable_gpu` | 是否启用 GPU 求解 |
+
+### 手推布料（机器人-布料交互）
+
+[`style3d/examples/example_hand_push_cloth.py`](style3d/examples/example_hand_push_cloth.py)
+
+将机器人手部关节模型（URDF/USDA）与 Style3D 布料仿真联合，演示机器人末端执行器推动布料的交互场景。
+
+```bash
+python style3d/examples/example_hand_push_cloth.py
+```
+
+### 3D-Sim 联合仿真
+
+[`style3d/examples/example_sim3dsim.py`](style3d/examples/example_sim3dsim.py)
+
+直接调用 `style3dsim` SDK 接口，演示布料与刚体的联合仿真，通过 Polyscope `Viewer` 渲染结果。
+
+```bash
+python style3d/examples/example_sim3dsim.py
+```
+
+## 项目结构
+
+```
+style3d/
+├── __init__.py
+├── simulation_login_template.json   # 登录配置模板
+├── style3d_mini/                    # 轻量级 Style3D 求解器封装
+│   └── style3d_mini.py
+├── style3d_pro/                     # SolverStyle3DPro 求解器
+│   ├── __init__.py
+│   └── solver_style3d_pro.py
+├── viewer/                          # Polyscope 可视化
+│   ├── __init__.py
+│   ├── viewer.py                    # 通用 Viewer 基类
+│   └── viewer_newton.py             # Newton 集成 Viewer
+└── examples/                        # 示例脚本
+    ├── example_style3d.py
+    ├── example_style3d_pro.py
+    ├── example_hand_push_cloth.py
+    ├── example_sim3dsim.py
+    ├── push_cloth_wonik_allegro/
+    └── push_cloth_zjrx/
 ```
 
 ## Contributing and Development
