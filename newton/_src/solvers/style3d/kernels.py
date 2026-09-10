@@ -199,6 +199,28 @@ def init_step_kernel(
 
 
 @wp.kernel
+def init_inertia_warm_start_kernel(
+    x_inertia: wp.array[wp.vec3],
+    x_curr: wp.array[wp.vec3],
+    # outputs
+    dx: wp.array[wp.vec3],
+):
+    """ITER1: seed the first nonlinear iterate's PCG guess with the FULL inertial step.
+
+    ``init_step_kernel`` leaves ``dx = v_prev * dt``; the inertial target is
+    ``x_inertia = x + v*dt + (g + f/m)*dt^2``, so the stock guess is short by
+    exactly the gravity/external-force displacement of the substep.  On the
+    global-translation mode there is no stiffness to drive that residual, so a
+    truncated PCG never recovers it.  This writes ``dx = x_inertia - x_curr``
+    instead, i.e. it hands PCG the free-flight step and lets it solve only for
+    the elastic correction.  Inactive particles get 0 either way, because
+    ``init_step_kernel`` sets ``x_inertia = x_prev = x_curr`` for them.
+    """
+    tid = wp.tid()
+    dx[tid] = x_inertia[tid] - x_curr[tid]
+
+
+@wp.kernel
 def init_rhs_kernel(
     dt: float,
     x_curr: wp.array[wp.vec3],

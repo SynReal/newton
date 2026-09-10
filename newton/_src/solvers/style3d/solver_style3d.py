@@ -15,6 +15,7 @@ from .collision import Collision
 from .kernels import (
     accumulate_dragging_pd_diag_kernel,
     eval_aero_force_kernel,
+    init_inertia_warm_start_kernel,
     eval_bend_kernel,
     eval_drag_force_kernel,
     eval_stretch_kernel,
@@ -165,6 +166,8 @@ class SolverStyle3D(SolverBase):
         enable_mouse_dragging: bool = False,
         enable_translation_preconditioner: bool = False,
         vel_damping: float = 0.998,
+        linear_schedule: str = "ramp",
+        inertia_warm_start: bool = False,
     ):
         """
         Args:
@@ -177,6 +180,15 @@ class SolverStyle3D(SolverBase):
             vel_damping: AERO1 -- per-step multiplicative velocity damping applied in
                 ``update_velocity``.  0.998 reproduces the historical hard-coded value
                 bit for bit; it is the solver's only unconditional dissipation term.
+            linear_schedule: ITER1 -- how many PCG iterations each nonlinear iteration gets
+                when the translation preconditioner is OFF.  ``"ramp"`` (default) keeps the
+                historical hard-coded ``min(iter + 1, 10)``, under which ``linear_iterations``
+                is simply never read on that path.  ``"fixed"`` honours ``linear_iterations``
+                on every nonlinear iteration.  The TP path already uses ``linear_iterations``
+                and is unaffected either way.
+            inertia_warm_start: ITER1 -- seed the first nonlinear iteration's PCG guess with
+                ``x_inertia - x_curr`` (the full free-flight step) instead of the stock
+                ``v_prev * dt``.  Default False = bit-identical to before.
         """
 
         super().__init__(model)
@@ -226,6 +238,11 @@ class SolverStyle3D(SolverBase):
         self._translation_contact_hessian_diags = self._translation_zero_contact_hessian
 
         self.vel_damping = float(vel_damping)
+
+        if linear_schedule not in ("ramp", "fixed"):
+            raise ValueError(f"linear_schedule must be 'ramp' or 'fixed', got {linear_schedule!r}")
+        self.linear_schedule = str(linear_schedule)
+        self.inertia_warm_start = bool(inertia_warm_start)
 
         # AERO1: per-triangle aerodynamic drag/lift.  Enabled only when the model
         # actually carries a non-zero drag or lift coefficient
@@ -311,6 +328,22 @@ class SolverStyle3D(SolverBase):
             ],
             device=self.device,
         )
+
+        # ITER1: hand the first nonlinear iteration the full inertial step as its
+        # PCG guess.  Placed right after init_step_kernel, which is what writes
+        # both `x_inertia` and the stock `dx = v_prev * dt`.  Nothing between here
+        # and the solve reads `dx` (the dragging block writes pd_diags only, and
+        # `Collision.linear_iteration_end` is a no-op), and `nonlinear_step_kernel`
+        # zeroes `dx` at the end of every iteration, so this only affects iter 0.
+        # OFF -> not launched at all.
+        if self.inertia_warm_start:
+            wp.launch(
+                kernel=init_inertia_warm_start_kernel,
+                dim=self.model.particle_count,
+                inputs=[self.x_inertia, state_in.particle_q],
+                outputs=[self.dx],
+                device=self.device,
+            )
 
         if self.enable_mouse_dragging:
             wp.launch(
@@ -438,7 +471,10 @@ class SolverStyle3D(SolverBase):
                     self.rhs,
                     self.inv_A_diags,
                     self.dx,
-                    wp.min(_iter + 1, 10),
+                    # ITER1: "ramp" reproduces the historical hard-coded schedule
+                    # exactly (and keeps `linear_iterations` unread on this path);
+                    # "fixed" honours `linear_iterations` every iteration.
+                    wp.min(_iter + 1, 10) if self.linear_schedule == "ramp" else self.linear_iterations,
                     hessian_multiply,
                 )
 
