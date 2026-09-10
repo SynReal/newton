@@ -94,6 +94,266 @@ def _apply_translation_preconditioner_kernel(
         z[tid] = z[tid] + correction
 
 
+# --------------------------------------------------------------------- ITER3
+# Rigid-mode Galerkin coarse correction (`coarse_correction` = 0 / 1 / 6).
+#
+# Runs ONCE per nonlinear iteration, on the PCG *initial guess*, OUTSIDE the PCG
+# loop (so it is not a preconditioner and does not change the Krylov space).
+# `A_i` is the per-particle diagonal block `m_i/dt^2 * I + H_contact,i` -- the
+# same approximation `_accumulate_translation_preconditioner_kernel` makes,
+# and it is exact for the translation mode because the PD elastic matrix
+# annihilates a rigid translation.  With `r` the residual at `x0 = 0` (= rhs):
+#
+#   mode 1:  t_c = (sum_i r_i) ./ (sum_i a_i)              (componentwise)
+#   mode 6:  [ D   -C  ] [t]   [ sum_i r_i        ]
+#            [-C^T  S  ] [w] = [ sum_i q_i x r_i  ] ,  q_i = x_i - centroid_c
+#            D = diag(sum a_i), C = sum diag(a_i) skew(q_i),
+#            S = sum skew(q_i)^T diag(a_i) skew(q_i)
+#   displacement u_i = t + w x q_i.
+#
+# The 6x6 is solved by its Schur complement onto w (D is diagonal), so only a
+# 3x3 inverse is needed and everything stays inside one device thread per
+# component.  Reductions are bucketed (`_CC_BUCKETS` slots per component) so no
+# single address takes every particle's atomic.
+_CC_BUCKETS = 256
+_CC_NACC_T = 6       # mode 1: sum r (3) + sum a (3)
+_CC_NACC_R = 21      # mode 6: sum r (3), sum q x r (3), sum a (3), C (6), S (6)
+_CC_NACC_C = 4       # centroid: sum x (3) + count (1)
+
+
+@wp.kernel
+def _cc_centroid_acc_kernel(
+    particle_q: wp.array[wp.vec3],
+    particle_component: wp.array[wp.int32],
+    particle_flags: wp.array[wp.int32],
+    n_buckets: int,
+    n_comp: int,
+    # outputs
+    partial: wp.array[float],
+):
+    tid = wp.tid()
+    if particle_flags[tid] & ParticleFlags.ACTIVE:
+        comp_idx = wp.min(wp.max(particle_component[tid], 0), n_comp - 1)
+        base = (comp_idx * n_buckets + (tid % n_buckets)) * 4
+        p = particle_q[tid]
+        wp.atomic_add(partial, base + 0, p[0])
+        wp.atomic_add(partial, base + 1, p[1])
+        wp.atomic_add(partial, base + 2, p[2])
+        wp.atomic_add(partial, base + 3, 1.0)
+
+
+@wp.kernel
+def _cc_reduce_kernel(
+    partial: wp.array[float],
+    n_buckets: int,
+    n_acc: int,
+    # outputs
+    total: wp.array[float],
+):
+    tid = wp.tid()                       # dim = n_comp * n_acc
+    comp_idx = tid // n_acc
+    k = tid - comp_idx * n_acc
+    s = float(0.0)
+    for b in range(n_buckets):
+        s = s + partial[(comp_idx * n_buckets + b) * n_acc + k]
+    total[tid] = s
+
+
+@wp.kernel
+def _cc_centroid_finish_kernel(
+    total: wp.array[float],
+    # outputs
+    centroid: wp.array[wp.vec3],
+):
+    c = wp.tid()
+    n = total[c * 4 + 3]
+    if n > 0.0:
+        centroid[c] = wp.vec3(total[c * 4 + 0] / n, total[c * 4 + 1] / n, total[c * 4 + 2] / n)
+    else:
+        centroid[c] = wp.vec3(0.0, 0.0, 0.0)
+
+
+@wp.kernel
+def _cc_moment_t_acc_kernel(
+    dt: float,
+    residual: wp.array[wp.vec3],
+    particle_component: wp.array[wp.int32],
+    particle_masses: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    contact_hessian_diags: wp.array[wp.mat33],
+    n_buckets: int,
+    n_comp: int,
+    # outputs
+    partial: wp.array[float],
+):
+    tid = wp.tid()
+    if particle_flags[tid] & ParticleFlags.ACTIVE:
+        comp_idx = wp.min(wp.max(particle_component[tid], 0), n_comp - 1)
+        base = (comp_idx * n_buckets + (tid % n_buckets)) * 6
+        r = residual[tid]
+        mass_diag = particle_masses[tid] / (dt * dt)
+        h = contact_hessian_diags[tid]
+        wp.atomic_add(partial, base + 0, r[0])
+        wp.atomic_add(partial, base + 1, r[1])
+        wp.atomic_add(partial, base + 2, r[2])
+        wp.atomic_add(partial, base + 3, mass_diag + h[0, 0])
+        wp.atomic_add(partial, base + 4, mass_diag + h[1, 1])
+        wp.atomic_add(partial, base + 5, mass_diag + h[2, 2])
+
+
+@wp.kernel
+def _cc_moment_r_acc_kernel(
+    dt: float,
+    residual: wp.array[wp.vec3],
+    particle_q: wp.array[wp.vec3],
+    centroid: wp.array[wp.vec3],
+    particle_component: wp.array[wp.int32],
+    particle_masses: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    contact_hessian_diags: wp.array[wp.mat33],
+    n_buckets: int,
+    n_comp: int,
+    # outputs
+    partial: wp.array[float],
+):
+    tid = wp.tid()
+    if particle_flags[tid] & ParticleFlags.ACTIVE:
+        comp_idx = wp.min(wp.max(particle_component[tid], 0), n_comp - 1)
+        base = (comp_idx * n_buckets + (tid % n_buckets)) * 21
+        r = residual[tid]
+        q = particle_q[tid] - centroid[comp_idx]
+        mass_diag = particle_masses[tid] / (dt * dt)
+        h = contact_hessian_diags[tid]
+        a0 = mass_diag + h[0, 0]
+        a1 = mass_diag + h[1, 1]
+        a2 = mass_diag + h[2, 2]
+        qr = wp.cross(q, r)
+        qx = q[0]
+        qy = q[1]
+        qz = q[2]
+        wp.atomic_add(partial, base + 0, r[0])
+        wp.atomic_add(partial, base + 1, r[1])
+        wp.atomic_add(partial, base + 2, r[2])
+        wp.atomic_add(partial, base + 3, qr[0])
+        wp.atomic_add(partial, base + 4, qr[1])
+        wp.atomic_add(partial, base + 5, qr[2])
+        wp.atomic_add(partial, base + 6, a0)
+        wp.atomic_add(partial, base + 7, a1)
+        wp.atomic_add(partial, base + 8, a2)
+        # C = sum diag(a) * skew(q); six independent entries
+        wp.atomic_add(partial, base + 9, a0 * qz)
+        wp.atomic_add(partial, base + 10, a0 * qy)
+        wp.atomic_add(partial, base + 11, a1 * qz)
+        wp.atomic_add(partial, base + 12, a1 * qx)
+        wp.atomic_add(partial, base + 13, a2 * qy)
+        wp.atomic_add(partial, base + 14, a2 * qx)
+        # S = sum skew(q)^T diag(a) skew(q); symmetric
+        wp.atomic_add(partial, base + 15, a1 * qz * qz + a2 * qy * qy)
+        wp.atomic_add(partial, base + 16, a0 * qz * qz + a2 * qx * qx)
+        wp.atomic_add(partial, base + 17, a0 * qy * qy + a1 * qx * qx)
+        wp.atomic_add(partial, base + 18, -a2 * qx * qy)
+        wp.atomic_add(partial, base + 19, -a1 * qx * qz)
+        wp.atomic_add(partial, base + 20, -a0 * qy * qz)
+
+
+@wp.kernel
+def _cc_solve_t_kernel(
+    total: wp.array[float],
+    # outputs
+    t_out: wp.array[wp.vec3],
+):
+    c = wp.tid()
+    o = c * 6
+    t = wp.vec3(0.0, 0.0, 0.0)
+    if total[o + 3] > 0.0:
+        t[0] = total[o + 0] / total[o + 3]
+    if total[o + 4] > 0.0:
+        t[1] = total[o + 1] / total[o + 4]
+    if total[o + 5] > 0.0:
+        t[2] = total[o + 2] / total[o + 5]
+    t_out[c] = t
+
+
+@wp.kernel
+def _cc_solve_r_kernel(
+    total: wp.array[float],
+    # outputs
+    t_out: wp.array[wp.vec3],
+    w_out: wp.array[wp.vec3],
+):
+    c = wp.tid()
+    o = c * 21
+    bt = wp.vec3(total[o + 0], total[o + 1], total[o + 2])
+    bw = wp.vec3(total[o + 3], total[o + 4], total[o + 5])
+    a0 = total[o + 6]
+    a1 = total[o + 7]
+    a2 = total[o + 8]
+    t = wp.vec3(0.0, 0.0, 0.0)
+    w = wp.vec3(0.0, 0.0, 0.0)
+    if a0 > 0.0 and a1 > 0.0 and a2 > 0.0:
+        c0 = total[o + 9]
+        c1 = total[o + 10]
+        c2 = total[o + 11]
+        c3 = total[o + 12]
+        c4 = total[o + 13]
+        c5 = total[o + 14]
+        C = wp.mat33(0.0, -c0, c1,
+                     c2, 0.0, -c3,
+                     -c4, c5, 0.0)
+        S = wp.mat33(total[o + 15], total[o + 18], total[o + 19],
+                     total[o + 18], total[o + 16], total[o + 20],
+                     total[o + 19], total[o + 20], total[o + 17])
+        Dinv = wp.mat33(1.0 / a0, 0.0, 0.0,
+                        0.0, 1.0 / a1, 0.0,
+                        0.0, 0.0, 1.0 / a2)
+        CtDi = wp.transpose(C) * Dinv
+        K = S - CtDi * C
+        tr = K[0, 0] + K[1, 1] + K[2, 2]
+        det = wp.determinant(K)
+        # Scale-free rank check: a rotation mode with no lever arm (all q_i
+        # collinear, or a component of one particle) leaves K singular; fall
+        # back to translation only rather than inventing an omega.
+        if tr > 0.0 and wp.abs(det) > 1.0e-12 * tr * tr * tr:
+            w = wp.inverse(K) * (bw + CtDi * bt)
+        t = Dinv * (bt + C * w)
+    t_out[c] = t
+    w_out[c] = w
+
+
+@wp.kernel
+def _cc_apply_t_kernel(
+    t_in: wp.array[wp.vec3],
+    particle_component: wp.array[wp.int32],
+    particle_flags: wp.array[wp.int32],
+    n_comp: int,
+    # outputs
+    x0: wp.array[wp.vec3],
+):
+    tid = wp.tid()
+    if particle_flags[tid] & ParticleFlags.ACTIVE:
+        comp_idx = wp.min(wp.max(particle_component[tid], 0), n_comp - 1)
+        x0[tid] = x0[tid] + t_in[comp_idx]
+
+
+@wp.kernel
+def _cc_apply_r_kernel(
+    t_in: wp.array[wp.vec3],
+    w_in: wp.array[wp.vec3],
+    centroid: wp.array[wp.vec3],
+    particle_q: wp.array[wp.vec3],
+    particle_component: wp.array[wp.int32],
+    particle_flags: wp.array[wp.int32],
+    n_comp: int,
+    # outputs
+    x0: wp.array[wp.vec3],
+):
+    tid = wp.tid()
+    if particle_flags[tid] & ParticleFlags.ACTIVE:
+        comp_idx = wp.min(wp.max(particle_component[tid], 0), n_comp - 1)
+        q = particle_q[tid] - centroid[comp_idx]
+        x0[tid] = x0[tid] + t_in[comp_idx] + wp.cross(w_in[comp_idx], q)
+
+
 ########################################################################################################################
 #################################################    Style3D Solver    #################################################
 ########################################################################################################################
@@ -175,8 +435,9 @@ class SolverStyle3D(SolverBase):
         enable_mouse_dragging: bool = False,
         enable_translation_preconditioner: bool = False,
         vel_damping: float = 0.998,
-        linear_schedule: str = "ramp",
+        linear_schedule: str | None = None,
         inertia_warm_start: bool | str = False,
+        coarse_correction: int = 0,
     ):
         """
         Args:
@@ -202,8 +463,11 @@ class SolverStyle3D(SolverBase):
                                   ``iterations=10``: 64 PCG steps vs the ramp's 55 (+16 %),
                                   where ``"fixed"`` costs 100 (1.8x).
 
-                The TP path already uses ``linear_iterations`` on every iteration and is
-                unaffected by any of these.
+                ``None`` (the default) means "stock": the ramp on the non-TP path and
+                ``linear_iterations`` on the TP path, i.e. exactly what this solver did
+                before ITER3.  Naming a schedule EXPLICITLY makes it apply to BOTH
+                paths (ITER3 change 1) -- that is the only way the TP path can be put
+                on the ramp.
             inertia_warm_start: ITER1/ITER2 -- seed the first nonlinear iteration's PCG
                 guess with ``x_inertia - x_curr`` (the full free-flight step) instead of
                 the stock ``v_prev * dt``.  Accepts
@@ -233,6 +497,18 @@ class SolverStyle3D(SolverBase):
                                           support (``f_c = +m g`` -> the stock guess), with
                                           no velocity recursion, hence none of ``accel``'s
                                           ``(z-1)^2`` double root.
+            coarse_correction: ITER3 -- rigid-mode Galerkin coarse correction applied
+                to the PCG initial guess at the START of every nonlinear iteration
+                (after the rhs is complete, before PCG; NOT inside the Krylov loop).
+
+                  ``0``  default, OFF, bit-identical to before;
+                  ``1``  translation only -- the same coarse operator the translation
+                         preconditioner uses, but spent once per nonlinear iteration
+                         on the guess instead of once per PCG step inside it;
+                  ``6``  translation + rotation -- a 6x6 per connected component.
+
+                Independent of ``inertia_warm_start``: with both on the guess is
+                ``warm start + coarse correction``, neither knows about the other.
         """
 
         super().__init__(model)
@@ -283,9 +559,42 @@ class SolverStyle3D(SolverBase):
 
         self.vel_damping = float(vel_damping)
 
-        if linear_schedule not in ("ramp", "fixed", "ramp_it0"):
+        # ---------------------------------------------------------------- ITER3
+        self.coarse_correction = int(coarse_correction)
+        if self.coarse_correction not in (0, 1, 6):
             raise ValueError(
-                f"linear_schedule must be 'ramp', 'fixed' or 'ramp_it0', got {linear_schedule!r}"
+                f"coarse_correction must be 0, 1 or 6, got {coarse_correction!r}"
+            )
+        self._cc_partial = None
+        self._cc_total = None
+        self._cc_t = None
+        self._cc_w = None
+        self._cc_x0 = None
+        self._cc_centroid = None
+        self._cc_cpartial = None
+        self._cc_ctotal = None
+        if self.coarse_correction:
+            _nc = self._translation_component_count
+            _na = _CC_NACC_T if self.coarse_correction == 1 else _CC_NACC_R
+            self._cc_partial = wp.zeros(_nc * _CC_BUCKETS * _na, dtype=float, device=self.device)
+            self._cc_total = wp.zeros(_nc * _na, dtype=float, device=self.device)
+            self._cc_t = wp.zeros(_nc, dtype=wp.vec3, device=self.device)
+            self._cc_w = wp.zeros(_nc, dtype=wp.vec3, device=self.device)
+            self._cc_x0 = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+            if self.coarse_correction == 6:
+                self._cc_centroid = wp.zeros(_nc, dtype=wp.vec3, device=self.device)
+                self._cc_cpartial = wp.zeros(_nc * _CC_BUCKETS * _CC_NACC_C, dtype=float,
+                                             device=self.device)
+                self._cc_ctotal = wp.zeros(_nc * _CC_NACC_C, dtype=float, device=self.device)
+
+        # ITER3: `None` = "stock" -- the historical per-path behaviour (ramp off the
+        # TP path, `linear_iterations` on it).  An EXPLICIT name applies to both.
+        if linear_schedule is None:
+            linear_schedule = "stock"
+        if linear_schedule not in ("stock", "ramp", "fixed", "ramp_it0"):
+            raise ValueError(
+                "linear_schedule must be None/'stock'/'ramp'/'fixed'/'ramp_it0', "
+                f"got {linear_schedule!r}"
             )
         self.linear_schedule = str(linear_schedule)
 
@@ -362,11 +671,131 @@ class SolverStyle3D(SolverBase):
         ``"ramp"`` returns exactly the expression this stack always had, so the
         default path is bit-identical.
         """
+        if self.linear_schedule in ("ramp", "stock"):
+            return wp.min(_iter + 1, 10)
+        if self.linear_schedule == "ramp_it0":
+            return self.linear_iterations if _iter == 0 else wp.min(_iter + 1, 10)
+        return self.linear_iterations
+
+    # ------------------------------------------------------------ ITER3
+    def _linear_steps_tp(self, _iter: int) -> int:
+        """PCG steps for nonlinear iteration ``_iter`` on the TP path.
+
+        ``"stock"`` (the default, i.e. nobody named a schedule) returns exactly the
+        ``self.linear_iterations`` this path always passed, so the default TP-on
+        task is bit-identical.  Naming a schedule now reaches this path too.
+        """
+        if self.linear_schedule == "stock":
+            return self.linear_iterations
         if self.linear_schedule == "ramp":
             return wp.min(_iter + 1, 10)
         if self.linear_schedule == "ramp_it0":
             return self.linear_iterations if _iter == 0 else wp.min(_iter + 1, 10)
         return self.linear_iterations
+
+    # ------------------------------------------------------------- ITER3
+    def _cc_update_centroid(self, particle_q) -> None:
+        """Per-component centroid, once per substep, from the substep's start state.
+
+        Only the CONDITIONING of the 6x6 depends on the origin -- the rigid-mode
+        subspace itself does not -- so a centroid that is one substep stale is
+        still an exact Galerkin correction, and it costs one pass instead of two.
+        """
+        nc = self._translation_component_count
+        self._cc_cpartial.zero_()
+        wp.launch(
+            _cc_centroid_acc_kernel,
+            dim=self.model.particle_count,
+            inputs=[particle_q, self._translation_particle_component,
+                    self.model.particle_flags, _CC_BUCKETS, nc],
+            outputs=[self._cc_cpartial],
+            device=self.device,
+        )
+        wp.launch(
+            _cc_reduce_kernel,
+            dim=nc * _CC_NACC_C,
+            inputs=[self._cc_cpartial, _CC_BUCKETS, _CC_NACC_C],
+            outputs=[self._cc_ctotal],
+            device=self.device,
+        )
+        wp.launch(
+            _cc_centroid_finish_kernel,
+            dim=nc,
+            inputs=[self._cc_ctotal],
+            outputs=[self._cc_centroid],
+            device=self.device,
+        )
+
+    def _cc_apply(self, dt: float, particle_q, x0) -> None:
+        """Add the rigid-mode coarse correction of ``self.rhs`` into ``x0``."""
+        nc = self._translation_component_count
+        n = self.model.particle_count
+        self._cc_partial.zero_()
+        if self.coarse_correction == 1:
+            wp.launch(
+                _cc_moment_t_acc_kernel,
+                dim=n,
+                inputs=[dt, self.rhs, self._translation_particle_component,
+                        self.model.particle_mass, self.model.particle_flags,
+                        self._translation_contact_hessian_diags, _CC_BUCKETS, nc],
+                outputs=[self._cc_partial],
+                device=self.device,
+            )
+            wp.launch(
+                _cc_reduce_kernel,
+                dim=nc * _CC_NACC_T,
+                inputs=[self._cc_partial, _CC_BUCKETS, _CC_NACC_T],
+                outputs=[self._cc_total],
+                device=self.device,
+            )
+            wp.launch(_cc_solve_t_kernel, dim=nc, inputs=[self._cc_total],
+                      outputs=[self._cc_t], device=self.device)
+            wp.launch(
+                _cc_apply_t_kernel,
+                dim=n,
+                inputs=[self._cc_t, self._translation_particle_component,
+                        self.model.particle_flags, nc],
+                outputs=[x0],
+                device=self.device,
+            )
+        else:
+            wp.launch(
+                _cc_moment_r_acc_kernel,
+                dim=n,
+                inputs=[dt, self.rhs, particle_q, self._cc_centroid,
+                        self._translation_particle_component,
+                        self.model.particle_mass, self.model.particle_flags,
+                        self._translation_contact_hessian_diags, _CC_BUCKETS, nc],
+                outputs=[self._cc_partial],
+                device=self.device,
+            )
+            wp.launch(
+                _cc_reduce_kernel,
+                dim=nc * _CC_NACC_R,
+                inputs=[self._cc_partial, _CC_BUCKETS, _CC_NACC_R],
+                outputs=[self._cc_total],
+                device=self.device,
+            )
+            wp.launch(_cc_solve_r_kernel, dim=nc, inputs=[self._cc_total],
+                      outputs=[self._cc_t, self._cc_w], device=self.device)
+            wp.launch(
+                _cc_apply_r_kernel,
+                dim=n,
+                inputs=[self._cc_t, self._cc_w, self._cc_centroid, particle_q,
+                        self._translation_particle_component,
+                        self.model.particle_flags, nc],
+                outputs=[x0],
+                device=self.device,
+            )
+
+    def iter3_provenance(self) -> str:
+        """The one ``[ITER3]`` self-provenance line every run must print."""
+        return ("[ITER3] coarse_correction=%d linear_schedule=%s tp=%s "
+                "linear_iterations=%d nonlinear_iterations=%d components=%d"
+                % (self.coarse_correction, self.linear_schedule,
+                   bool(self.enable_translation_preconditioner),
+                   int(self.linear_iterations), int(self.nonlinear_iterations),
+                   int(self._translation_component_count)))
 
     # ------------------------------------------------------------- ITER2
     def _iter2_mark_contact_gate(self, state_in: State, state_out: State) -> None:
@@ -585,6 +1014,11 @@ class SolverStyle3D(SolverBase):
                 device=self.device,
             )
 
+        # ITER3: one centroid per substep, from the substep-start positions
+        # (`state_in.particle_q` is still `x_prev` here).  OFF -> not launched.
+        if self.coarse_correction == 6:
+            self._cc_update_centroid(state_in.particle_q)
+
         if self.enable_mouse_dragging:
             wp.launch(
                 accumulate_dragging_pd_diag_kernel,
@@ -712,15 +1146,31 @@ class SolverStyle3D(SolverBase):
                 )
 
             hessian_multiply = None if self.collision is None else self.collision.hessian_multiply
+            # ITER3: the rigid-mode coarse correction goes into the PCG GUESS,
+            # here -- after the rhs is complete (inertia + elastic + contact) and
+            # before PCG.  OFF -> `_x0` is the very same expression as before and
+            # not one kernel is launched.
+            if self.coarse_correction:
+                if _iter == 0:
+                    self._cc_x0.assign(self.dx)
+                else:
+                    self._cc_x0.zero_()
+                self._cc_apply(dt, state_in.particle_q, self._cc_x0)
+                _x0 = self._cc_x0
+            else:
+                _x0 = self.dx if _iter == 0 else None
             if self.enable_translation_preconditioner:
                 self.linear_solver.solve(
                     self.pd_non_diags,
                     self.static_A_diags,
-                    self.dx if _iter == 0 else None,
+                    _x0,
                     self.rhs,
                     self.inv_A_diags,
                     self.dx,
-                    self.linear_iterations,
+                    # ITER3: the TP path now honours an explicitly named schedule;
+                    # "stock" (the default) returns `self.linear_iterations`, which
+                    # is the literal value this call always passed.
+                    self._linear_steps_tp(_iter),
                     hessian_multiply,
                     self._apply_translation_preconditioner,
                 )
@@ -728,7 +1178,7 @@ class SolverStyle3D(SolverBase):
                 self.linear_solver.solve(
                     self.pd_non_diags,
                     self.static_A_diags,
-                    self.dx if _iter == 0 else None,
+                    _x0,
                     self.rhs,
                     self.inv_A_diags,
                     self.dx,
