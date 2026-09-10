@@ -14,6 +14,7 @@ from .builder import PDMatrixBuilder
 from .collision import Collision
 from .kernels import (
     accumulate_dragging_pd_diag_kernel,
+    eval_aero_force_kernel,
     eval_bend_kernel,
     eval_drag_force_kernel,
     eval_stretch_kernel,
@@ -163,6 +164,7 @@ class SolverStyle3D(SolverBase):
         drag_spring_stiff: float = 1e2,
         enable_mouse_dragging: bool = False,
         enable_translation_preconditioner: bool = False,
+        vel_damping: float = 0.998,
     ):
         """
         Args:
@@ -172,6 +174,9 @@ class SolverStyle3D(SolverBase):
             drag_spring_stiff: The stiffness of spring connecting barycentric-weighted drag-point and target-point.
             enable_mouse_dragging: Enable/disable dragging kernel.
             enable_translation_preconditioner: Enable a coarse per-component translation preconditioner for PCG.
+            vel_damping: AERO1 -- per-step multiplicative velocity damping applied in
+                ``update_velocity``.  0.998 reproduces the historical hard-coded value
+                bit for bit; it is the solver's only unconditional dissipation term.
         """
 
         super().__init__(model)
@@ -220,6 +225,24 @@ class SolverStyle3D(SolverBase):
         self._translation_zero_contact_hessian = wp.zeros(model.particle_count, dtype=wp.mat33, device=self.device)
         self._translation_contact_hessian_diags = self._translation_zero_contact_hessian
 
+        self.vel_damping = float(vel_damping)
+
+        # AERO1: per-triangle aerodynamic drag/lift.  Enabled only when the model
+        # actually carries a non-zero drag or lift coefficient
+        # (``ModelBuilder.add_triangles(tri_drag=..., tri_lift=...)`` ->
+        # ``tri_materials[:, 3:5]``).  With the stock all-zero defaults nothing
+        # extra is allocated and ``step()`` hands ``init_step_kernel`` the very
+        # same ``state_in.particle_f`` array it did before this feature existed,
+        # so the OFF path is unchanged down to the kernel arguments.
+        self._aero_enabled = False
+        self._f_ext_aero = None
+        _tri_mat = getattr(model, "tri_materials", None)
+        if _tri_mat is not None and model.tri_count > 0:
+            _m = _tri_mat.numpy()
+            if _m.shape[1] > 4 and (np.any(_m[:, 3] != 0.0) or np.any(_m[:, 4] != 0.0)):
+                self._aero_enabled = True
+                self._f_ext_aero = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+
         # Drag info
         self.drag_pos = wp.zeros(1, dtype=wp.vec3, device=self.device)
         self.drag_index = wp.array([-1], dtype=int, device=self.device)
@@ -246,6 +269,26 @@ class SolverStyle3D(SolverBase):
         self._translation_preconditioner_dt = dt
         self._translation_contact_hessian_diags = self._translation_zero_contact_hessian
 
+        # AERO1: fold the aerodynamic force into the external-force array handed to
+        # the inertia term.  OFF -> `f_ext` IS `state_in.particle_f` (no copy, no
+        # launch, identical kernel arguments).
+        f_ext = state_in.particle_f
+        if self._aero_enabled:
+            self._f_ext_aero.assign(state_in.particle_f)
+            wp.launch(
+                kernel=eval_aero_force_kernel,
+                dim=self.model.tri_count,
+                inputs=[
+                    state_in.particle_q,
+                    state_in.particle_qd,
+                    self.model.tri_indices,
+                    self.model.tri_materials,
+                ],
+                outputs=[self._f_ext_aero],
+                device=self.device,
+            )
+            f_ext = self._f_ext_aero
+
         wp.launch(
             kernel=init_step_kernel,
             dim=self.model.particle_count,
@@ -253,7 +296,7 @@ class SolverStyle3D(SolverBase):
                 dt,
                 self.model.gravity,
                 self.model.particle_world,
-                state_in.particle_f,
+                f_ext,
                 state_in.particle_qd,
                 state_in.particle_q,
                 self.x_prev,
@@ -430,7 +473,7 @@ class SolverStyle3D(SolverBase):
         wp.launch(
             kernel=update_velocity,
             dim=self.model.particle_count,
-            inputs=[dt, self.x_prev, state_out.particle_q],
+            inputs=[dt, self.vel_damping, self.x_prev, state_out.particle_q],
             outputs=[state_out.particle_qd],
             device=self.device,
         )

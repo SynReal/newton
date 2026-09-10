@@ -262,11 +262,71 @@ def nonlinear_step_kernel(
 
 
 @wp.kernel
+def eval_aero_force_kernel(
+    pos: wp.array[wp.vec3],
+    vel: wp.array[wp.vec3],
+    faces: wp.array2d[wp.int32],
+    tri_materials: wp.array2d[float],
+    # outputs
+    f_aero: wp.array[wp.vec3],
+):
+    """AERO1: per-triangle aerodynamic drag + lift, accumulated per particle.
+
+    Same force law as newton's semi-implicit solver
+    (``solvers/semi_implicit/kernels_particle.py``), read from the same two
+    ``tri_materials`` columns (3 = drag, 4 = lift)::
+
+        f_drag = k_drag * A * |n . v_mid| * v_mid
+        f_lift = k_lift * A * (pi/2 - acos(n . v_hat)) * |v_mid|^2 * n
+
+    Both act AGAINST the triangle's motion; the total is split evenly over the
+    three vertices.  ``k_drag = 0.5 * rho * C_d`` in SI, so for air at
+    ``rho = 1.2`` and a flat plate ``C_d ~ 1.2`` the physical value is ~0.7.
+
+    Skipped triangle-wise when both coefficients are zero, so a model built
+    with the stock defaults (0.0) contributes exactly nothing.
+    """
+    fid = wp.tid()
+
+    k_drag = tri_materials[fid, 3]
+    k_lift = tri_materials[fid, 4]
+    if k_drag == 0.0 and k_lift == 0.0:
+        return
+
+    i = faces[fid, 0]
+    j = faces[fid, 1]
+    k = faces[fid, 2]
+
+    x0 = pos[i]
+    cr = wp.cross(pos[j] - x0, pos[k] - x0)
+    area2 = wp.length(cr)
+    if area2 <= 0.0:
+        return
+    n = cr / area2
+    area = 0.5 * area2
+
+    v_mid = (vel[i] + vel[j] + vel[k]) / 3.0
+    v_len = wp.length(v_mid)
+    if v_len <= 0.0:
+        return
+    v_dir = v_mid / v_len
+
+    f_drag = v_mid * (k_drag * area * wp.abs(wp.dot(n, v_mid)))
+    f_lift = n * (k_lift * area * (wp.HALF_PI - wp.acos(wp.clamp(wp.dot(n, v_dir), -1.0, 1.0))) * v_len * v_len)
+
+    f_vert = -(f_drag + f_lift) / 3.0
+    wp.atomic_add(f_aero, i, f_vert)
+    wp.atomic_add(f_aero, j, f_vert)
+    wp.atomic_add(f_aero, k, f_vert)
+
+
+@wp.kernel
 def update_velocity(
     dt: float,
+    vel_damping: float,
     prev_pos: wp.array[wp.vec3],
     pos: wp.array[wp.vec3],
     vel: wp.array[wp.vec3],
 ):
     particle = wp.tid()
-    vel[particle] = 0.998 * (pos[particle] - prev_pos[particle]) / dt
+    vel[particle] = vel_damping * (pos[particle] - prev_pos[particle]) / dt
