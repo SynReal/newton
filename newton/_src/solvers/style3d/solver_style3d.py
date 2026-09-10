@@ -189,12 +189,21 @@ class SolverStyle3D(SolverBase):
             vel_damping: AERO1 -- per-step multiplicative velocity damping applied in
                 ``update_velocity``.  0.998 reproduces the historical hard-coded value
                 bit for bit; it is the solver's only unconditional dissipation term.
-            linear_schedule: ITER1 -- how many PCG iterations each nonlinear iteration gets
-                when the translation preconditioner is OFF.  ``"ramp"`` (default) keeps the
-                historical hard-coded ``min(iter + 1, 10)``, under which ``linear_iterations``
-                is simply never read on that path.  ``"fixed"`` honours ``linear_iterations``
-                on every nonlinear iteration.  The TP path already uses ``linear_iterations``
-                and is unaffected either way.
+            linear_schedule: ITER1/ITER2e -- how many PCG iterations each nonlinear
+                iteration gets when the translation preconditioner is OFF.
+
+                  ``"ramp"``      default; the historical hard-coded ``min(iter + 1, 10)``,
+                                  under which ``linear_iterations`` is never read on that path.
+                  ``"fixed"``     honour ``linear_iterations`` on every nonlinear iteration.
+                  ``"ramp_it0"``  ITER2e: ``linear_iterations`` on the FIRST nonlinear
+                                  iteration only, ``min(iter + 1, 10)`` afterwards.  The
+                                  warm start's residual is entirely in iteration 0, and that
+                                  is the one the ramp starves (1 PCG step).  Cost at
+                                  ``iterations=10``: 64 PCG steps vs the ramp's 55 (+16 %),
+                                  where ``"fixed"`` costs 100 (1.8x).
+
+                The TP path already uses ``linear_iterations`` on every iteration and is
+                unaffected by any of these.
             inertia_warm_start: ITER1/ITER2 -- seed the first nonlinear iteration's PCG
                 guess with ``x_inertia - x_curr`` (the full free-flight step) instead of
                 the stock ``v_prev * dt``.  Accepts
@@ -274,8 +283,10 @@ class SolverStyle3D(SolverBase):
 
         self.vel_damping = float(vel_damping)
 
-        if linear_schedule not in ("ramp", "fixed"):
-            raise ValueError(f"linear_schedule must be 'ramp' or 'fixed', got {linear_schedule!r}")
+        if linear_schedule not in ("ramp", "fixed", "ramp_it0"):
+            raise ValueError(
+                f"linear_schedule must be 'ramp', 'fixed' or 'ramp_it0', got {linear_schedule!r}"
+            )
         self.linear_schedule = str(linear_schedule)
 
         # ITER2: `inertia_warm_start` grew a third value.  The two historical
@@ -343,6 +354,19 @@ class SolverStyle3D(SolverBase):
         self.drag_pos = wp.zeros(1, dtype=wp.vec3, device=self.device)
         self.drag_index = wp.array([-1], dtype=int, device=self.device)
         self.drag_bary_coord = wp.zeros(1, dtype=wp.vec3, device=self.device)
+
+    # ------------------------------------------------------------ ITER2e
+    def _linear_steps(self, _iter: int) -> int:
+        """PCG steps for nonlinear iteration ``_iter`` on the non-TP path.
+
+        ``"ramp"`` returns exactly the expression this stack always had, so the
+        default path is bit-identical.
+        """
+        if self.linear_schedule == "ramp":
+            return wp.min(_iter + 1, 10)
+        if self.linear_schedule == "ramp_it0":
+            return self.linear_iterations if _iter == 0 else wp.min(_iter + 1, 10)
+        return self.linear_iterations
 
     # ------------------------------------------------------------- ITER2
     def _iter2_mark_contact_gate(self, state_in: State, state_out: State) -> None:
@@ -711,7 +735,12 @@ class SolverStyle3D(SolverBase):
                     # ITER1: "ramp" reproduces the historical hard-coded schedule
                     # exactly (and keeps `linear_iterations` unread on this path);
                     # "fixed" honours `linear_iterations` every iteration.
-                    wp.min(_iter + 1, 10) if self.linear_schedule == "ramp" else self.linear_iterations,
+                    # ITER2e: "ramp_it0" gives iteration 0 -- the only one the warm
+                    # start's residual lives in, and the one the ramp starves with a
+                    # single PCG step -- the full `linear_iterations`, then rejoins
+                    # the ramp.  Host-side loop count only; the captured graph stays
+                    # a fixed-length unroll either way.
+                    self._linear_steps(_iter),
                     hessian_multiply,
                 )
 
