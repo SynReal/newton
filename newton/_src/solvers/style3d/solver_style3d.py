@@ -17,6 +17,7 @@ from .kernels import (
     eval_aero_force_kernel,
     init_inertia_warm_start_kernel,
     init_inertia_warm_start_free_kernel,
+    init_accel_warm_start_kernel,
     iter2_gate_count_kernel,
     iter2_gate_peak_kernel,
     iter2_gate_mark_ee_kernel,
@@ -204,6 +205,15 @@ class SolverStyle3D(SolverBase):
                                           stock guess, so the 39 um free-flight offset no
                                           longer rides into the contact stack's
                                           "iteration 0 == x_prev" assumption.
+                  ``"accel"``             ITER2b: constant-acceleration predictor,
+                                          ``dx = v_prev*dt + a_prev*dt^2`` with
+                                          ``a_prev = (v_prev - v_prev2)/dt`` measured from
+                                          the two previous substeps.  Exact in free flight
+                                          (``a_prev = g``) AND at rest on a support
+                                          (``a_prev = 0``); no particle classification, no
+                                          contact lookup, no parameter.  This is the
+                                          candidate; ``"free"`` is kept only so its ITER2
+                                          measurements stay reproducible.
         """
 
         super().__init__(model)
@@ -270,9 +280,10 @@ class SolverStyle3D(SolverBase):
                 _mode = "all"
         else:
             _mode = "all" if bool(_iws) else "off"
-        if _mode not in ("off", "all", "free"):
+        if _mode not in ("off", "all", "free", "accel"):
             raise ValueError(
-                f"inertia_warm_start must be False/True/'off'/'all'/'free', got {inertia_warm_start!r}"
+                "inertia_warm_start must be False/True/'off'/'all'/'free'/'accel', "
+                f"got {inertia_warm_start!r}"
             )
         self.inertia_warm_start_mode = _mode
         self.inertia_warm_start = _mode != "off"
@@ -282,6 +293,14 @@ class SolverStyle3D(SolverBase):
         self.iter2_gate = None
         self.iter2_gate_stat = None
         self.iter2_gate_peak = None
+        # ITER2b: the substep-before-last velocity, so the predictor can measure
+        # a_prev.  Primed on the first step with the current velocity, which
+        # makes a_prev = 0 there, i.e. the first substep degenerates to the
+        # stock `dx = v_prev*dt`.
+        self.v_prev2 = None
+        self._accel_primed = False
+        if _mode == "accel":
+            self.v_prev2 = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
         if _mode == "free":
             self.iter2_gate = wp.zeros(model.particle_count, dtype=wp.int32, device=self.device)
             # [0] = marked particles in the substep just run (device-side counter)
@@ -392,7 +411,8 @@ class SolverStyle3D(SolverBase):
         """
         n = int(self.model.particle_count)
         if self.iter2_gate_stat is None:
-            return f"[ITER2] warm_start={self.inertia_warm_start_mode} gated=0/{n} gated_peak=0"
+            # off / all / accel: there is no gate, so no gated counts to report.
+            return f"[ITER2] warm_start={self.inertia_warm_start_mode} particles={n}"
         g = int(self.iter2_gate_stat.numpy()[0])
         pk = int(self.iter2_gate_peak.numpy()[0])
         return (f"[ITER2] warm_start={self.inertia_warm_start_mode} "
@@ -477,6 +497,22 @@ class SolverStyle3D(SolverBase):
                 outputs=[self.dx],
                 device=self.device,
             )
+        elif self.inertia_warm_start_mode == "accel":
+            # ITER2b: only the STARTING POINT changes; `x_inertia` (the inertia
+            # term of the energy) is untouched.  The copy below must come after
+            # the launch that reads `v_prev2`; both are on the same stream, so
+            # the order holds inside a captured graph as well.
+            if not self._accel_primed:
+                wp.copy(self.v_prev2, state_in.particle_qd)
+                self._accel_primed = True
+            wp.launch(
+                kernel=init_accel_warm_start_kernel,
+                dim=self.model.particle_count,
+                inputs=[dt, state_in.particle_qd, self.v_prev2, self.model.particle_flags],
+                outputs=[self.dx],
+                device=self.device,
+            )
+            wp.copy(self.v_prev2, state_in.particle_qd)
         elif self.inertia_warm_start_mode == "free":
             # ITER2: mark the contacting particles first, then hand the warm
             # start only to the rest.  Everything below is fixed-dim, device

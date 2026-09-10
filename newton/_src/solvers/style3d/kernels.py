@@ -487,6 +487,44 @@ def init_inertia_warm_start_free_kernel(
         dx[tid] = x_inertia[tid] - x_curr[tid]
 
 
+# ------------------------------------------------------------------ ITER2b
+@wp.kernel
+def init_accel_warm_start_kernel(
+    dt: float,
+    v_prev: wp.array[wp.vec3],
+    v_prev2: wp.array[wp.vec3],
+    particle_flags: wp.array[wp.int32],
+    # outputs
+    dx: wp.array[wp.vec3],
+):
+    """ITER2b: constant-acceleration predictor for the first nonlinear iterate.
+
+    The guess is only a starting point for Newton; the requirement on it is
+    "close to the true solution", and the true displacement of a substep is
+    ``v*dt + a*dt^2`` with ``a`` including the CONTACT force.  ITER1 used
+    ``a = g``, which is exact in free flight but pushes a particle resting on a
+    support ``g*dt^2 = 39 um`` into it every substep.  Here ``a`` is measured
+    from the two previous substeps instead:
+
+        a_prev = (v_prev - v_prev2) / dt
+        dx     = v_prev*dt + a_prev*dt^2
+
+    In free flight ``a_prev = g`` (exact, same as ITER1); at rest on a support
+    ``a_prev = 0`` (exact, same as the stock guess).  It is only wrong on the
+    single substep where the acceleration jumps, and it self-corrects on the
+    next one, so nothing accumulates.  No particle classification, no contact
+    lookup, no discontinuity between neighbours, no parameter.
+
+    Inactive particles are skipped so they keep the ``dx = 0`` that
+    ``init_step_kernel`` wrote.
+    """
+    tid = wp.tid()
+    if not particle_flags[tid] & ParticleFlags.ACTIVE:
+        return
+    a_prev = (v_prev[tid] - v_prev2[tid]) / dt
+    dx[tid] = v_prev[tid] * dt + a_prev * dt * dt
+
+
 @wp.kernel
 def init_rhs_kernel(
     dt: float,
