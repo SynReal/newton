@@ -525,6 +525,66 @@ def init_accel_warm_start_kernel(
     dx[tid] = v_prev[tid] * dt + a_prev * dt * dt
 
 
+# ------------------------------------------------------------------ ITER2c
+@wp.kernel
+def iter2c_contact_force_delta_kernel(
+    rhs: wp.array[wp.vec3],
+    # in/out: on entry the snapshot of `rhs` taken BEFORE the contact pass,
+    # on exit the contact contribution alone
+    f_contact: wp.array[wp.vec3],
+):
+    """Isolate the contact force out of the shared right-hand side.
+
+    ``rhs`` carries inertia + stretch + bend + (drag) before
+    ``Collision.accumulate_contact_force`` adds the contact terms into the same
+    array, so the contact part is exactly the difference across that call.
+    """
+    tid = wp.tid()
+    f_contact[tid] = rhs[tid] - f_contact[tid]
+
+
+@wp.kernel
+def init_accel_f_warm_start_kernel(
+    dt: float,
+    gravity: wp.array[wp.vec3],
+    particle_world: wp.array[wp.int32],
+    v_prev: wp.array[wp.vec3],
+    f_contact: wp.array[wp.vec3],
+    particle_masses: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    # outputs
+    dx: wp.array[wp.vec3],
+):
+    """ITER2c: first-iterate guess from gravity + the PREVIOUS substep's contact force.
+
+        dx = v_prev*dt + (g + f_c_prev/m)*dt^2
+
+    ``f_c_prev`` is the contact force accumulated at the LAST nonlinear
+    iteration of the previous substep -- contact only, no elastic/bending term.
+
+    Why this is not the ITER2b predictor: nothing here is extrapolated from a
+    velocity difference, so there is no ``v_{n+1} = 2 v_n - v_{n-1}`` recursion
+    and no ``(z-1)^2`` double root.  In free flight ``f_c_prev = 0`` and the
+    guess is identically ITER1's (exact); at rest on a support ``f_c_prev =
+    +m g`` and the guess is identically the stock ``v_prev*dt`` (no push into
+    the support).  The only feedback path left runs through the contact force
+    itself, and only on particles that actually have contact.
+
+    First substep: ``f_contact`` is still zero, i.e. the guess degenerates to
+    ITER1's.  Inactive particles keep the ``dx = 0`` that ``init_step_kernel``
+    wrote.
+    """
+    tid = wp.tid()
+    if not particle_flags[tid] & ParticleFlags.ACTIVE:
+        return
+    world_g = gravity[wp.max(particle_world[tid], 0)]
+    mass = particle_masses[tid]
+    accel = world_g
+    if mass > 0.0:
+        accel = world_g + f_contact[tid] / mass
+    dx[tid] = v_prev[tid] * dt + accel * dt * dt
+
+
 @wp.kernel
 def init_rhs_kernel(
     dt: float,

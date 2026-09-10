@@ -18,6 +18,8 @@ from .kernels import (
     init_inertia_warm_start_kernel,
     init_inertia_warm_start_free_kernel,
     init_accel_warm_start_kernel,
+    init_accel_f_warm_start_kernel,
+    iter2c_contact_force_delta_kernel,
     iter2_gate_count_kernel,
     iter2_gate_peak_kernel,
     iter2_gate_mark_ee_kernel,
@@ -214,6 +216,14 @@ class SolverStyle3D(SolverBase):
                                           contact lookup, no parameter.  This is the
                                           candidate; ``"free"`` is kept only so its ITER2
                                           measurements stay reproducible.
+                  ``"accel_f"``           ITER2c: ``dx = v_prev*dt + (g + f_c_prev/m)*dt^2``
+                                          with ``f_c_prev`` the CONTACT force from the last
+                                          nonlinear iteration of the previous substep
+                                          (no elastic/bending term).  Exact in free flight
+                                          (``f_c = 0`` -> ITER1's guess) and at rest on a
+                                          support (``f_c = +m g`` -> the stock guess), with
+                                          no velocity recursion, hence none of ``accel``'s
+                                          ``(z-1)^2`` double root.
         """
 
         super().__init__(model)
@@ -280,9 +290,9 @@ class SolverStyle3D(SolverBase):
                 _mode = "all"
         else:
             _mode = "all" if bool(_iws) else "off"
-        if _mode not in ("off", "all", "free", "accel"):
+        if _mode not in ("off", "all", "free", "accel", "accel_f"):
             raise ValueError(
-                "inertia_warm_start must be False/True/'off'/'all'/'free'/'accel', "
+                "inertia_warm_start must be False/True/'off'/'all'/'free'/'accel'/'accel_f', "
                 f"got {inertia_warm_start!r}"
             )
         self.inertia_warm_start_mode = _mode
@@ -301,6 +311,11 @@ class SolverStyle3D(SolverBase):
         self._accel_primed = False
         if _mode == "accel":
             self.v_prev2 = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+        # ITER2c: the previous substep's contact force.  Zero on the first
+        # substep, which makes the guess ITER1's.
+        self.f_contact = None
+        if _mode == "accel_f":
+            self.f_contact = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
         if _mode == "free":
             self.iter2_gate = wp.zeros(model.particle_count, dtype=wp.int32, device=self.device)
             # [0] = marked particles in the substep just run (device-side counter)
@@ -497,6 +512,26 @@ class SolverStyle3D(SolverBase):
                 outputs=[self.dx],
                 device=self.device,
             )
+        elif self.inertia_warm_start_mode == "accel_f":
+            # ITER2c: only the STARTING POINT changes; `x_inertia` is untouched.
+            # `f_contact` was filled at the last nonlinear iteration of the
+            # previous substep (see the grab below); it is still zero on the
+            # first substep.
+            wp.launch(
+                kernel=init_accel_f_warm_start_kernel,
+                dim=self.model.particle_count,
+                inputs=[
+                    dt,
+                    self.model.gravity,
+                    self.model.particle_world,
+                    state_in.particle_qd,
+                    self.f_contact,
+                    self.model.particle_mass,
+                    self.model.particle_flags,
+                ],
+                outputs=[self.dx],
+                device=self.device,
+            )
         elif self.inertia_warm_start_mode == "accel":
             # ITER2b: only the STARTING POINT changes; `x_inertia` (the inertia
             # term of the energy) is untouched.  The copy below must come after
@@ -599,6 +634,18 @@ class SolverStyle3D(SolverBase):
                     device=self.device,
                 )
 
+            # ITER2c: snapshot the rhs right before the contact pass of the
+            # LAST nonlinear iteration; the difference across that pass is the
+            # contact force alone (inertia/stretch/bend are already in there).
+            _grab_fc = (self.inertia_warm_start_mode == "accel_f"
+                        and _iter == self.nonlinear_iterations - 1)
+            if _grab_fc:
+                if self.collision is None:
+                    self.f_contact.zero_()
+                    _grab_fc = False
+                else:
+                    wp.copy(self.f_contact, self.rhs)
+
             if self.collision is not None:
                 self.collision.accumulate_contact_force(
                     dt,
@@ -628,6 +675,15 @@ class SolverStyle3D(SolverBase):
                     dim=self.model.particle_count,
                     inputs=[self.static_A_diags],
                     outputs=[self.inv_A_diags],
+                    device=self.device,
+                )
+
+            if _grab_fc:
+                wp.launch(
+                    kernel=iter2c_contact_force_delta_kernel,
+                    dim=self.model.particle_count,
+                    inputs=[self.rhs],
+                    outputs=[self.f_contact],
                     device=self.device,
                 )
 
