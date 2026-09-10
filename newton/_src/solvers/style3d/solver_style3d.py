@@ -16,6 +16,12 @@ from .kernels import (
     accumulate_dragging_pd_diag_kernel,
     eval_aero_force_kernel,
     init_inertia_warm_start_kernel,
+    init_inertia_warm_start_free_kernel,
+    iter2_gate_count_kernel,
+    iter2_gate_peak_kernel,
+    iter2_gate_mark_ee_kernel,
+    iter2_gate_mark_tri_sdf_kernel,
+    iter2_gate_mark_vf_kernel,
     eval_bend_kernel,
     eval_drag_force_kernel,
     eval_stretch_kernel,
@@ -167,7 +173,7 @@ class SolverStyle3D(SolverBase):
         enable_translation_preconditioner: bool = False,
         vel_damping: float = 0.998,
         linear_schedule: str = "ramp",
-        inertia_warm_start: bool = False,
+        inertia_warm_start: bool | str = False,
     ):
         """
         Args:
@@ -186,9 +192,18 @@ class SolverStyle3D(SolverBase):
                 is simply never read on that path.  ``"fixed"`` honours ``linear_iterations``
                 on every nonlinear iteration.  The TP path already uses ``linear_iterations``
                 and is unaffected either way.
-            inertia_warm_start: ITER1 -- seed the first nonlinear iteration's PCG guess with
-                ``x_inertia - x_curr`` (the full free-flight step) instead of the stock
-                ``v_prev * dt``.  Default False = bit-identical to before.
+            inertia_warm_start: ITER1/ITER2 -- seed the first nonlinear iteration's PCG
+                guess with ``x_inertia - x_curr`` (the full free-flight step) instead of
+                the stock ``v_prev * dt``.  Accepts
+
+                  ``False`` / ``"off"``   default, bit-identical to before;
+                  ``True``  / ``"all"``   ITER1: every particle, bit-identical to ITER1;
+                  ``"free"``              ITER2: only particles that carry NO contact pair
+                                          this substep (cloth-cloth broad phase + tri-SDF
+                                          blade AABB).  A contacting particle keeps the
+                                          stock guess, so the 39 um free-flight offset no
+                                          longer rides into the contact stack's
+                                          "iteration 0 == x_prev" assumption.
         """
 
         super().__init__(model)
@@ -242,7 +257,37 @@ class SolverStyle3D(SolverBase):
         if linear_schedule not in ("ramp", "fixed"):
             raise ValueError(f"linear_schedule must be 'ramp' or 'fixed', got {linear_schedule!r}")
         self.linear_schedule = str(linear_schedule)
-        self.inertia_warm_start = bool(inertia_warm_start)
+
+        # ITER2: `inertia_warm_start` grew a third value.  The two historical
+        # ones keep their exact meaning (and `self.inertia_warm_start` stays a
+        # truthy bool for anything that looked at it).
+        _iws = inertia_warm_start
+        if isinstance(_iws, str):
+            _mode = _iws.strip().lower()
+            if _mode in ("", "0", "off", "false", "no"):
+                _mode = "off"
+            elif _mode in ("1", "on", "true", "yes", "all"):
+                _mode = "all"
+        else:
+            _mode = "all" if bool(_iws) else "off"
+        if _mode not in ("off", "all", "free"):
+            raise ValueError(
+                f"inertia_warm_start must be False/True/'off'/'all'/'free', got {inertia_warm_start!r}"
+            )
+        self.inertia_warm_start_mode = _mode
+        self.inertia_warm_start = _mode != "off"
+        # ITER2 gate: 1 = this particle carries a contact pair this substep.
+        # Allocated only in 'free' mode, so the other two paths do not even pay
+        # the allocation.
+        self.iter2_gate = None
+        self.iter2_gate_stat = None
+        self.iter2_gate_peak = None
+        if _mode == "free":
+            self.iter2_gate = wp.zeros(model.particle_count, dtype=wp.int32, device=self.device)
+            # [0] = marked particles in the substep just run (device-side counter)
+            self.iter2_gate_stat = wp.zeros(1, dtype=wp.int32, device=self.device)
+            # [0] = running maximum of the above over the whole run
+            self.iter2_gate_peak = wp.zeros(1, dtype=wp.int32, device=self.device)
 
         # AERO1: per-triangle aerodynamic drag/lift.  Enabled only when the model
         # actually carries a non-zero drag or lift coefficient
@@ -264,6 +309,94 @@ class SolverStyle3D(SolverBase):
         self.drag_pos = wp.zeros(1, dtype=wp.vec3, device=self.device)
         self.drag_index = wp.array([-1], dtype=int, device=self.device)
         self.drag_bary_coord = wp.zeros(1, dtype=wp.vec3, device=self.device)
+
+    # ------------------------------------------------------------- ITER2
+    def _iter2_mark_contact_gate(self, state_in: State, state_out: State) -> None:
+        """Flag every particle that carries a contact pair in THIS substep.
+
+        Filters the cloth-cloth broad-phase lists ``Collision.frame_begin``
+        just built from ``x_prev`` through the force kernels' own narrow-phase
+        predicates (the raw lists are proximity lists and would mark the whole
+        cloth), and re-runs the tri-SDF gather's AABB test on the same
+        positions.  ``state_in.particle_q`` is still ``x_prev`` here.  With no
+        collision object nothing is marked and ``free`` == ``all``.
+        """
+        gate = self.iter2_gate
+        gate.zero_()
+        col = self.collision
+        if col is None:
+            return
+        thickness = 2.0 * float(col.radius)      # same as accumulate_contact_force
+        if getattr(col, "stiff_vf", 0.0) > 0.0:
+            wp.launch(
+                kernel=iter2_gate_mark_vf_kernel,
+                dim=self.model.particle_count,
+                inputs=[thickness, state_in.particle_q, self.model.tri_indices, col.broad_phase_vf],
+                outputs=[gate],
+                device=self.device,
+            )
+        if getattr(col, "stiff_ee", 0.0) > 0.0:
+            wp.launch(
+                kernel=iter2_gate_mark_ee_kernel,
+                dim=self.model.edge_indices.shape[0],
+                inputs=[thickness, state_in.particle_q, self.model.edge_indices, col.broad_phase_ee],
+                outputs=[gate],
+                device=self.device,
+            )
+        if getattr(col, "tri_sdf_slot_shape", None) is not None and col.tri_sdf_compliant:
+            body_q = (
+                state_out.body_q if col.integrate_with_external_rigid_solver else state_in.body_q
+            )
+            wp.launch(
+                kernel=iter2_gate_mark_tri_sdf_kernel,
+                dim=col.tri_sdf_slots * int(self.model.tri_count),
+                inputs=[
+                    state_in.particle_q,
+                    self.model.tri_indices,
+                    int(self.model.tri_count),
+                    col.tri_sdf_slot_shape,
+                    self.model.shape_body,
+                    self.model.shape_transform,
+                    body_q,
+                    col.tri_sdf_bp_aabb_lo,
+                    col.tri_sdf_bp_aabb_hi,
+                    col.tri_sdf_h,
+                    col.tri_sdf_bp_slack,
+                ],
+                outputs=[gate],
+                device=self.device,
+            )
+        # Provenance counter (rule 35: read back from the device, never from the
+        # environment).  Device-side only, so it does not break graph capture.
+        self.iter2_gate_stat.zero_()
+        wp.launch(
+            kernel=iter2_gate_count_kernel,
+            dim=self.model.particle_count,
+            inputs=[gate],
+            outputs=[self.iter2_gate_stat],
+            device=self.device,
+        )
+        wp.launch(
+            kernel=iter2_gate_peak_kernel,
+            dim=1,
+            inputs=[self.iter2_gate_stat],
+            outputs=[self.iter2_gate_peak],
+            device=self.device,
+        )
+
+    def iter2_provenance(self) -> str:
+        """The one ``[ITER2]`` self-provenance line every run must print.
+
+        ``gated`` is read back from the device counter the last substep wrote,
+        never recomputed on the host.
+        """
+        n = int(self.model.particle_count)
+        if self.iter2_gate_stat is None:
+            return f"[ITER2] warm_start={self.inertia_warm_start_mode} gated=0/{n} gated_peak=0"
+        g = int(self.iter2_gate_stat.numpy()[0])
+        pk = int(self.iter2_gate_peak.numpy()[0])
+        return (f"[ITER2] warm_start={self.inertia_warm_start_mode} "
+                f"gated={g}/{n} gated_peak={pk}")
 
     @override
     def step(self, state_in: State, state_out: State, control: Control, contacts: Contacts, dt: float) -> None:
@@ -336,11 +469,23 @@ class SolverStyle3D(SolverBase):
         # `Collision.linear_iteration_end` is a no-op), and `nonlinear_step_kernel`
         # zeroes `dx` at the end of every iteration, so this only affects iter 0.
         # OFF -> not launched at all.
-        if self.inertia_warm_start:
+        if self.inertia_warm_start_mode == "all":
             wp.launch(
                 kernel=init_inertia_warm_start_kernel,
                 dim=self.model.particle_count,
                 inputs=[self.x_inertia, state_in.particle_q],
+                outputs=[self.dx],
+                device=self.device,
+            )
+        elif self.inertia_warm_start_mode == "free":
+            # ITER2: mark the contacting particles first, then hand the warm
+            # start only to the rest.  Everything below is fixed-dim, device
+            # side, no host readback -- the substep stays graph-capturable.
+            self._iter2_mark_contact_gate(state_in, state_out)
+            wp.launch(
+                kernel=init_inertia_warm_start_free_kernel,
+                dim=self.model.particle_count,
+                inputs=[self.x_inertia, state_in.particle_q, self.iter2_gate],
                 outputs=[self.dx],
                 device=self.device,
             )
