@@ -513,6 +513,35 @@ def init_inertia_warm_start_free_kernel(
         dx[tid] = x_inertia[tid] - x_curr[tid]
 
 
+# ------------------------------------------------------------------ ITER5c
+@wp.kernel
+def init_inertia_warm_start_free_v_kernel(
+    v_gate: float,
+    x_inertia: wp.array[wp.vec3],
+    x_curr: wp.array[wp.vec3],
+    v_prev: wp.array[wp.vec3],
+    gate: wp.array[wp.int32],
+    # outputs
+    dx: wp.array[wp.vec3],
+):
+    """ITER5c: the ITER1 guess, applied only to particles that are BOTH
+
+      * out of contact this substep (the ITER2/ITER5 `free` gate), AND
+      * already moving: ``|v_prev| > v_gate``.
+
+    Open loop -- ``v_prev`` is the substep's INPUT velocity, not anything the
+    solver produced this substep, so there is no `(z-1)^2` feedback of the kind
+    ITER2b's `accel` predictor had.  The point of the second gate: `g*dt^2` only
+    hurts where the cloth is at rest or supported; a flying sheet has
+    ``|v| >> v_gate``.  Below the gate the particle keeps exactly what
+    ``init_step_kernel`` wrote, i.e. the stock guess.
+    """
+    tid = wp.tid()
+    if gate[tid] == 0:
+        if wp.length(v_prev[tid]) > v_gate:
+            dx[tid] = x_inertia[tid] - x_curr[tid]
+
+
 # ------------------------------------------------------------------ ITER2b
 @wp.kernel
 def init_accel_warm_start_kernel(

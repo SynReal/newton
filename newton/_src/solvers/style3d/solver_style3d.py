@@ -17,6 +17,7 @@ from .kernels import (
     eval_aero_force_kernel,
     init_inertia_warm_start_kernel,
     init_inertia_warm_start_free_kernel,
+    init_inertia_warm_start_free_v_kernel,
     init_accel_warm_start_kernel,
     init_accel_f_warm_start_kernel,
     iter2c_contact_force_delta_kernel,
@@ -439,6 +440,7 @@ class SolverStyle3D(SolverBase):
         linear_schedule: str | None = None,
         inertia_warm_start: bool | str = False,
         coarse_correction: int = 0,
+        inertia_warm_start_v_gate: float = 0.05,
     ):
         """
         Args:
@@ -613,9 +615,10 @@ class SolverStyle3D(SolverBase):
                 _mode = "all"
         else:
             _mode = "all" if bool(_iws) else "off"
-        if _mode not in ("off", "all", "free", "accel", "accel_f"):
+        if _mode not in ("off", "all", "free", "free_v", "accel", "accel_f"):
             raise ValueError(
-                "inertia_warm_start must be False/True/'off'/'all'/'free'/'accel'/'accel_f', "
+                "inertia_warm_start must be False/True/'off'/'all'/'free'/'free_v'/"
+                "'accel'/'accel_f', "
                 f"got {inertia_warm_start!r}"
             )
         self.inertia_warm_start_mode = _mode
@@ -639,7 +642,9 @@ class SolverStyle3D(SolverBase):
         self.f_contact = None
         if _mode == "accel_f":
             self.f_contact = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
-        if _mode == "free":
+        # ITER5c: the velocity gate.  Read only in mode "free_v".
+        self.inertia_warm_start_v_gate = float(inertia_warm_start_v_gate)
+        if _mode in ("free", "free_v"):
             self.iter2_gate = wp.zeros(model.particle_count, dtype=wp.int32, device=self.device)
             # [0] = marked particles in the substep just run (device-side counter)
             self.iter2_gate_stat = wp.zeros(1, dtype=wp.int32, device=self.device)
@@ -898,8 +903,11 @@ class SolverStyle3D(SolverBase):
             return f"[ITER2] warm_start={self.inertia_warm_start_mode} particles={n}"
         g = int(self.iter2_gate_stat.numpy()[0])
         pk = int(self.iter2_gate_peak.numpy()[0])
+        # ITER5c: `free_v` carries the velocity gate in the same line.
+        vg = (" v_gate=%g" % self.inertia_warm_start_v_gate
+              if self.inertia_warm_start_mode == "free_v" else "")
         return (f"[ITER2] warm_start={self.inertia_warm_start_mode} "
-                f"gated={g}/{n} gated_peak={pk}")
+                f"gated={g}/{n} gated_peak={pk}{vg}")
 
     @override
     def step(self, state_in: State, state_out: State, control: Control, contacts: Contacts, dt: float) -> None:
@@ -1016,6 +1024,17 @@ class SolverStyle3D(SolverBase):
                 device=self.device,
             )
             wp.copy(self.v_prev2, state_in.particle_qd)
+        elif self.inertia_warm_start_mode == "free_v":
+            # ITER5c: same gate, plus |v_prev| > v_gate.
+            self._iter2_mark_contact_gate(state_in, state_out, contacts)
+            wp.launch(
+                kernel=init_inertia_warm_start_free_v_kernel,
+                dim=self.model.particle_count,
+                inputs=[self.inertia_warm_start_v_gate, self.x_inertia,
+                        state_in.particle_q, state_in.particle_qd, self.iter2_gate],
+                outputs=[self.dx],
+                device=self.device,
+            )
         elif self.inertia_warm_start_mode == "free":
             # ITER2: mark the contacting particles first, then hand the warm
             # start only to the rest.  Everything below is fixed-dim, device
