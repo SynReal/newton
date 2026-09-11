@@ -23,6 +23,7 @@ from .kernels import (
     iter2_gate_count_kernel,
     iter2_gate_peak_kernel,
     iter2_gate_mark_ee_kernel,
+    iter2_gate_mark_soft_kernel,
     iter2_gate_mark_tri_sdf_kernel,
     iter2_gate_mark_vf_kernel,
     eval_bend_kernel,
@@ -474,9 +475,11 @@ class SolverStyle3D(SolverBase):
 
                   ``False`` / ``"off"``   default, bit-identical to before;
                   ``True``  / ``"all"``   ITER1: every particle, bit-identical to ITER1;
-                  ``"free"``              ITER2: only particles that carry NO contact pair
-                                          this substep (cloth-cloth broad phase + tri-SDF
-                                          blade AABB).  A contacting particle keeps the
+                  ``"free"``              ITER2/ITER5: only particles that carry NO contact
+                                          pair this substep.  Channels: cloth-cloth broad
+                                          phase (vf + ee), the tri-SDF blade AABB, and
+                                          (ITER5) the particle-rigid soft contacts, i.e.
+                                          the TABLE.  A contacting particle keeps the
                                           stock guess, so the 39 um free-flight offset no
                                           longer rides into the contact stack's
                                           "iteration 0 == x_prev" assumption.
@@ -798,7 +801,8 @@ class SolverStyle3D(SolverBase):
                    int(self._translation_component_count)))
 
     # ------------------------------------------------------------- ITER2
-    def _iter2_mark_contact_gate(self, state_in: State, state_out: State) -> None:
+    def _iter2_mark_contact_gate(self, state_in: State, state_out: State,
+                                 contacts: Contacts | None = None) -> None:
         """Flag every particle that carries a contact pair in THIS substep.
 
         Filters the cloth-cloth broad-phase lists ``Collision.frame_begin``
@@ -810,6 +814,17 @@ class SolverStyle3D(SolverBase):
         """
         gate = self.iter2_gate
         gate.zero_()
+        # ITER5: the particle-rigid (soft) contacts -- cloth on the TABLE above
+        # all -- are a support the ITER2 gate never saw.  Marked FIRST so it is
+        # independent of whether a Style3D `collision` object exists at all.
+        if contacts is not None and getattr(contacts, "soft_contact_particle", None) is not None:
+            wp.launch(
+                kernel=iter2_gate_mark_soft_kernel,
+                dim=int(contacts.soft_contact_particle.shape[0]),
+                inputs=[contacts.soft_contact_count, contacts.soft_contact_particle],
+                outputs=[gate],
+                device=self.device,
+            )
         col = self.collision
         if col is None:
             return
@@ -1005,7 +1020,7 @@ class SolverStyle3D(SolverBase):
             # ITER2: mark the contacting particles first, then hand the warm
             # start only to the rest.  Everything below is fixed-dim, device
             # side, no host readback -- the substep stays graph-capturable.
-            self._iter2_mark_contact_gate(state_in, state_out)
+            self._iter2_mark_contact_gate(state_in, state_out, contacts)
             wp.launch(
                 kernel=init_inertia_warm_start_free_kernel,
                 dim=self.model.particle_count,

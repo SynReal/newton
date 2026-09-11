@@ -286,6 +286,32 @@ def iter2_triangle_barycentric(A: wp.vec3, B: wp.vec3, C: wp.vec3, P: wp.vec3):
 
 
 @wp.kernel
+def iter2_gate_mark_soft_kernel(
+    soft_contact_count: wp.array[wp.int32],
+    soft_contact_particle: wp.array[wp.int32],
+    # outputs
+    gate: wp.array[wp.int32],
+):
+    """ITER5: mark every particle that carries a PARTICLE-RIGID (soft) contact.
+
+    ITER2's gate only saw cloth-cloth (vf/ee) and the tri-SDF blades, so a
+    particle resting on the TABLE -- by far the most common support in every
+    task -- was classified "free" and still got the full `g*dt^2` warm start.
+    That is the channel the ITER2 rest bench measured as a ratchet.
+
+    `soft_contact_count` is a DEVICE counter; the launch dim is the fixed
+    `soft_contact_max`, so nothing is read back to the host and the substep
+    stays graph-capturable.
+    """
+    tid = wp.tid()
+    if tid >= soft_contact_count[0]:
+        return
+    p = soft_contact_particle[tid]
+    if p >= 0:
+        gate[p] = 1
+
+
+@wp.kernel
 def iter2_gate_mark_vf_kernel(
     thickness: float,
     pos: wp.array[wp.vec3],
