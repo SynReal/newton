@@ -177,6 +177,109 @@ def step_cg_kernel(
     x[i] = x[i] + alpha * p[i]
 
 
+# ------------------------------------------------------------------- ITER7
+# Adaptive PCG step count (`linear_schedule="adaptive"`).
+#
+# Stop when the preconditioned residual has dropped by eta:  with z = M^-1 r,
+# `rTz[k]` IS ||r_k||^2 in the M^-1 norm, so the standard relative test is
+#
+#       sqrt(rTz[k] / rTz[0]) <= eta      <=>      rTz[k] <= eta^2 * rTz[0]
+#
+# `rTz` is already computed by step3 every iteration, so the test costs one
+# 1-thread kernel and NO host readback.  The Python loop still runs the full
+# `linear_iterations` trips (the captured CUDA graph stays a fixed-length
+# unroll); the iterations after the stop are turned into no-ops on device by
+# `stop_flag`, which freezes p, x and r.  Lower bound is 1 step: iteration 0
+# always executes, the test only runs for iter >= 1.
+#
+# NOTE(cost): because the unroll is fixed, `adaptive` does NOT save kernel
+# launches under CUDA graph capture -- it changes the ITERATE, not the launch
+# count.  What it buys is the step-count distribution (`pcg_steps_hist`) and a
+# solution that stops at a residual target instead of a fixed trip count.
+@wp.kernel
+def pcg_check_stop_kernel(
+    iter: int,
+    eta2: float,
+    rTz: wp.array[float],
+    # outputs
+    stop_flag: wp.array[wp.int32],
+    steps_taken: wp.array[wp.int32],
+):
+    if iter == 0:
+        stop_flag[0] = 0
+        steps_taken[0] = 1          # lower bound: iteration 0 always runs
+        return
+    if stop_flag[0] != 0:
+        return
+    r0 = rTz[0]
+    rk = rTz[iter]
+    if (not wp.isnan(rk)) and (not wp.isnan(r0)) and (r0 > 0.0) and (rk <= eta2 * r0):
+        stop_flag[0] = 1            # steps_taken stays at `iter`
+    else:
+        steps_taken[0] = iter + 1
+
+
+@wp.kernel
+def pcg_record_steps_kernel(
+    steps_taken: wp.array[wp.int32],
+    # outputs
+    hist: wp.array[wp.int32],
+):
+    k = steps_taken[0]
+    if k >= 0 and k < hist.shape[0]:
+        wp.atomic_add(hist, k, 1)
+
+
+@wp.kernel
+def update_cg_direction_gated_kernel(
+    iter: int,
+    z: wp.array[wp.vec3],
+    rTz: wp.array[float],
+    p_prev: wp.array[wp.vec3],
+    stop_flag: wp.array[wp.int32],
+    # outputs
+    p: wp.array[wp.vec3],
+):
+    # Byte-for-byte `update_cg_direction_kernel` plus the ITER7 stop gate.
+    if stop_flag[0] != 0:
+        return
+    i = wp.tid()
+    new_p = z[i]
+    if iter > 0:
+        num = rTz[iter]
+        denom = rTz[iter - 1]
+        beta = wp.float32(0.0)
+        if (wp.abs(denom) > 1.0e-30) and (not wp.isnan(denom)) and (not wp.isnan(num)):
+            beta = num / denom
+        new_p += beta * p_prev[i]
+    p[i] = new_p
+
+
+@wp.kernel
+def step_cg_gated_kernel(
+    iter: int,
+    rTz: wp.array[float],
+    pTAp: wp.array[float],
+    p: wp.array[wp.vec3],
+    Ap: wp.array[wp.vec3],
+    stop_flag: wp.array[wp.int32],
+    # outputs
+    x: wp.array[wp.vec3],
+    r: wp.array[wp.vec3],
+):
+    # Byte-for-byte `step_cg_kernel` plus the ITER7 stop gate.
+    if stop_flag[0] != 0:
+        return
+    i = wp.tid()
+    num = rTz[iter]
+    denom = pTAp[iter]
+    alpha = wp.float32(0.0)
+    if (wp.abs(denom) > 1.0e-30) and (not wp.isnan(denom)) and (not wp.isnan(num)):
+        alpha = num / denom
+    r[i] = r[i] - alpha * Ap[i]
+    x[i] = x[i] + alpha * p[i]
+
+
 @wp.kernel
 def generate_test_data_kernel(
     dim: int,
@@ -258,6 +361,14 @@ class PcgSolver:
         self.Ap = wp.array(shape=dim, dtype=wp.vec3, device=device)
         self.pTAp = wp.array(shape=maxIter, dtype=float, device=device)
         self.rTz = wp.array(shape=maxIter, dtype=float, device=device)
+        # ------------------------------------------------------------ ITER7
+        # `adaptive` state.  Allocated unconditionally (a few ints) but only
+        # touched when `solve(..., eta=...)` is called with eta > 0, so the
+        # default path launches not one extra kernel.
+        self._stop_flag = wp.zeros(1, dtype=wp.int32, device=device)
+        self._steps_taken = wp.zeros(1, dtype=wp.int32, device=device)
+        # pcg_steps_hist[k] = how many PCG solves executed exactly k steps.
+        self.pcg_steps_hist = wp.zeros(maxIter + 1, dtype=wp.int32, device=device)
 
     def step1_update_r(
         self,
@@ -299,6 +410,25 @@ class PcgSolver:
             dim=self.dim,
             inputs=[iter, self.z, self.rTz, self.p],
             outputs=[self.p],
+            device=self.device,
+        )
+
+    # ------------------------------------------------------------ ITER7
+    def step4_update_p_gated(self, iter: int):
+        wp.launch(
+            update_cg_direction_gated_kernel,
+            dim=self.dim,
+            inputs=[iter, self.z, self.rTz, self.p, self._stop_flag],
+            outputs=[self.p],
+            device=self.device,
+        )
+
+    def step7_update_x_r_gated(self, x: wp.array[wp.vec3], iter: int):
+        wp.launch(
+            step_cg_gated_kernel,
+            dim=self.dim,
+            inputs=[iter, self.rTz, self.pTAp, self.p, self.Ap, self._stop_flag],
+            outputs=[x, self.r],
             device=self.device,
         )
 
@@ -348,9 +478,13 @@ class PcgSolver:
         iterations: int,
         additional_multiplier: Callable | None = None,
         preconditioner: Callable | None = None,
+        eta: float = 0.0,
     ):
         # Prevent out-of-bounds in rTz/pTAp when iterations > maxIter.
         iterations = wp.min(iterations, self.maxIter)
+        # ITER7: eta <= 0 -> the historical fixed-trip-count loop, bit-identical.
+        adaptive = float(eta) > 0.0
+        eta2 = float(eta) * float(eta)
 
         if x0 is None:
             x1.zero_()
@@ -368,7 +502,18 @@ class PcgSolver:
             if preconditioner is not None:
                 preconditioner(self.r, self.z)
             self.step3_update_rTz(iter)
-            self.step4_update_p(iter)
+            if adaptive:
+                # ITER7: decide (on device) whether THIS iteration still updates.
+                wp.launch(
+                    pcg_check_stop_kernel,
+                    dim=1,
+                    inputs=[iter, eta2, self.rTz],
+                    outputs=[self._stop_flag, self._steps_taken],
+                    device=self.device,
+                )
+                self.step4_update_p_gated(iter)
+            else:
+                self.step4_update_p(iter)
 
             if additional_multiplier is None:
                 self.step5_update_Ap(A_non_diag, A_diag)
@@ -377,7 +522,19 @@ class PcgSolver:
                 self.step5_update_Ap(A_non_diag, A_diag, additional_Ap)
 
             self.step6_update_pTAp(iter)
-            self.step7_update_x_r(x1, iter)
+            if adaptive:
+                self.step7_update_x_r_gated(x1, iter)
+            else:
+                self.step7_update_x_r(x1, iter)
+
+        if adaptive:
+            wp.launch(
+                pcg_record_steps_kernel,
+                dim=1,
+                inputs=[self._steps_taken],
+                outputs=[self.pcg_steps_hist],
+                device=self.device,
+            )
 
 
 if __name__ == "__main__":

@@ -96,6 +96,67 @@ def _apply_translation_preconditioner_kernel(
         z[tid] = z[tid] + correction
 
 
+# --------------------------------------------------------------------- ITER7
+# Bucketed two-level reduction for the translation preconditioner
+# (`tp_reduce` = "legacy" | "bucket").
+#
+# `_accumulate_translation_preconditioner_kernel` has EVERY active particle
+# atomic-add into one slot per connected component.  On a single-component
+# cloth that is one address taking all N atomics.  The bucketed form is the
+# same one `coarse_correction` already uses: each particle adds into
+# `tid % _TP_BUCKETS` of its component, then a second pass sums the buckets.
+#
+# The accumulators are identical to mode 1 of the coarse correction --
+# sum r (3) + sum a (3), a_i = m_i/dt^2 + H_contact,i -- so this reuses
+# `_cc_reduce_kernel` verbatim for the second level.
+#
+# NOT bit-identical to "legacy": float addition is not associative and the
+# summation order changes.  That is why it sits behind a switch whose default
+# is "legacy".
+_TP_BUCKETS = 256
+_TP_NACC = 6
+
+
+@wp.kernel
+def _tp_bucket_acc_kernel(
+    dt: float,
+    residual: wp.array[wp.vec3],
+    particle_component: wp.array[wp.int32],
+    particle_masses: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    contact_hessian_diags: wp.array[wp.mat33],
+    n_buckets: int,
+    n_comp: int,
+    # outputs
+    partial: wp.array[float],
+):
+    tid = wp.tid()
+    if particle_flags[tid] & ParticleFlags.ACTIVE:
+        comp_idx = wp.min(wp.max(particle_component[tid], 0), n_comp - 1)
+        base = (comp_idx * n_buckets + (tid % n_buckets)) * 6
+        r = residual[tid]
+        mass_diag = particle_masses[tid] / (dt * dt)
+        h = contact_hessian_diags[tid]
+        wp.atomic_add(partial, base + 0, r[0])
+        wp.atomic_add(partial, base + 1, r[1])
+        wp.atomic_add(partial, base + 2, r[2])
+        wp.atomic_add(partial, base + 3, mass_diag + h[0, 0])
+        wp.atomic_add(partial, base + 4, mass_diag + h[1, 1])
+        wp.atomic_add(partial, base + 5, mass_diag + h[2, 2])
+
+
+@wp.kernel
+def _tp_bucket_finish_kernel(
+    total: wp.array[float],
+    # outputs
+    coarse_rhs: wp.array[wp.vec3],
+    coarse_diag: wp.array[wp.vec3],
+):
+    c = wp.tid()
+    coarse_rhs[c] = wp.vec3(total[c * 6 + 0], total[c * 6 + 1], total[c * 6 + 2])
+    coarse_diag[c] = wp.vec3(total[c * 6 + 3], total[c * 6 + 4], total[c * 6 + 5])
+
+
 # --------------------------------------------------------------------- ITER3
 # Rigid-mode Galerkin coarse correction (`coarse_correction` = 0 / 1 / 6).
 #
@@ -438,6 +499,8 @@ class SolverStyle3D(SolverBase):
         enable_translation_preconditioner: bool = False,
         vel_damping: float = 0.998,
         linear_schedule: str | None = None,
+        tp_reduce: str = "legacy",
+        pcg_eta: float = 0.1,
         inertia_warm_start: bool | str = False,
         coarse_correction: int = 0,
         inertia_warm_start_v_gate: float = 0.05,
@@ -596,12 +659,24 @@ class SolverStyle3D(SolverBase):
         # TP path, `linear_iterations` on it).  An EXPLICIT name applies to both.
         if linear_schedule is None:
             linear_schedule = "stock"
-        if linear_schedule not in ("stock", "ramp", "fixed", "ramp_it0"):
+        if linear_schedule not in ("stock", "ramp", "fixed", "ramp_it0", "adaptive"):
             raise ValueError(
-                "linear_schedule must be None/'stock'/'ramp'/'fixed'/'ramp_it0', "
+                "linear_schedule must be None/'stock'/'ramp'/'fixed'/'ramp_it0'/'adaptive', "
                 f"got {linear_schedule!r}"
             )
         self.linear_schedule = str(linear_schedule)
+        # ------------------------------------------------------------ ITER7
+        if str(tp_reduce) not in ("legacy", "bucket"):
+            raise ValueError(f"tp_reduce must be 'legacy' or 'bucket', got {tp_reduce!r}")
+        self.tp_reduce = str(tp_reduce)
+        self.pcg_eta = float(pcg_eta)
+        # `adaptive` is the ONLY schedule that arms the PCG stop test; every other
+        # schedule passes eta = 0 into PcgSolver.solve and keeps the historical
+        # fixed-trip-count loop, bit for bit.
+        self._pcg_eta_active = self.pcg_eta if self.linear_schedule == "adaptive" else 0.0
+        # Bucket scratch: allocated only when the bucket path is selected.
+        self._tp_partial = None
+        self._tp_total = None
 
         # ITER2: `inertia_warm_start` grew a third value.  The two historical
         # ones keep their exact meaning (and `self.inertia_warm_start` stays a
@@ -683,6 +758,8 @@ class SolverStyle3D(SolverBase):
             return wp.min(_iter + 1, 10)
         if self.linear_schedule == "ramp_it0":
             return self.linear_iterations if _iter == 0 else wp.min(_iter + 1, 10)
+        # ITER7 "adaptive": `linear_iterations` is the UPPER bound only; the
+        # actual step count is decided on device inside PcgSolver.solve.
         return self.linear_iterations
 
     # ------------------------------------------------------------ ITER3
@@ -799,11 +876,13 @@ class SolverStyle3D(SolverBase):
     def iter3_provenance(self) -> str:
         """The one ``[ITER3]`` self-provenance line every run must print."""
         return ("[ITER3] coarse_correction=%d linear_schedule=%s tp=%s "
-                "linear_iterations=%d nonlinear_iterations=%d components=%d"
+                "linear_iterations=%d nonlinear_iterations=%d components=%d "
+                "tp_reduce=%s pcg_eta=%.4g"
                 % (self.coarse_correction, self.linear_schedule,
                    bool(self.enable_translation_preconditioner),
                    int(self.linear_iterations), int(self.nonlinear_iterations),
-                   int(self._translation_component_count)))
+                   int(self._translation_component_count),
+                   self.tp_reduce, self._pcg_eta_active))
 
     # ------------------------------------------------------------- ITER2
     def _iter2_mark_contact_gate(self, state_in: State, state_out: State,
@@ -1207,6 +1286,8 @@ class SolverStyle3D(SolverBase):
                     self._linear_steps_tp(_iter),
                     hessian_multiply,
                     self._apply_translation_preconditioner,
+                    # ITER7: 0.0 for every schedule but "adaptive".
+                    self._pcg_eta_active,
                 )
             else:
                 self.linear_solver.solve(
@@ -1226,6 +1307,9 @@ class SolverStyle3D(SolverBase):
                     # a fixed-length unroll either way.
                     self._linear_steps(_iter),
                     hessian_multiply,
+                    None,
+                    # ITER7: 0.0 for every schedule but "adaptive".
+                    self._pcg_eta_active,
                 )
 
             if self.collision is not None:
@@ -1316,6 +1400,12 @@ class SolverStyle3D(SolverBase):
         return max(1, len(component_map)), particle_component
 
     def _apply_translation_preconditioner(self, residual: wp.array[wp.vec3], z: wp.array[wp.vec3]) -> None:
+        # ITER7: "bucket" replaces the single-slot atomic accumulation with the
+        # two-level bucketed reduction (same accumulators, different summation
+        # ORDER -- so not bit-identical; default stays "legacy").
+        if self.tp_reduce == "bucket":
+            self._apply_translation_preconditioner_bucket(residual, z)
+            return
         self._translation_coarse_rhs.zero_()
         self._translation_coarse_diag.zero_()
         wp.launch(
@@ -1333,6 +1423,66 @@ class SolverStyle3D(SolverBase):
                 self._translation_coarse_rhs,
                 self._translation_coarse_diag,
             ],
+            device=self.device,
+        )
+        wp.launch(
+            _apply_translation_preconditioner_kernel,
+            dim=self.model.particle_count,
+            inputs=[
+                self._translation_coarse_rhs,
+                self._translation_coarse_diag,
+                self._translation_particle_component,
+                self.model.particle_flags,
+            ],
+            outputs=[z],
+            device=self.device,
+        )
+
+    # ------------------------------------------------------------- ITER7
+    def _apply_translation_preconditioner_bucket(
+        self, residual: wp.array[wp.vec3], z: wp.array[wp.vec3]
+    ) -> None:
+        """Bucketed two-level reduction (`tp_reduce="bucket"`).
+
+        Same accumulators as the legacy kernel (sum r, sum a), but each particle
+        adds into `tid % _TP_BUCKETS` of its component first, so no single
+        address takes every atomic.  The second level reuses `_cc_reduce_kernel`.
+        """
+        n_comp = self._translation_coarse_diag.shape[0]
+        if self._tp_partial is None:
+            self._tp_partial = wp.zeros(
+                n_comp * _TP_BUCKETS * _TP_NACC, dtype=float, device=self.device
+            )
+            self._tp_total = wp.zeros(n_comp * _TP_NACC, dtype=float, device=self.device)
+        self._tp_partial.zero_()
+        wp.launch(
+            _tp_bucket_acc_kernel,
+            dim=self.model.particle_count,
+            inputs=[
+                self._translation_preconditioner_dt,
+                residual,
+                self._translation_particle_component,
+                self.model.particle_mass,
+                self.model.particle_flags,
+                self._translation_contact_hessian_diags,
+                _TP_BUCKETS,
+                n_comp,
+            ],
+            outputs=[self._tp_partial],
+            device=self.device,
+        )
+        wp.launch(
+            _cc_reduce_kernel,
+            dim=n_comp * _TP_NACC,
+            inputs=[self._tp_partial, _TP_BUCKETS, _TP_NACC],
+            outputs=[self._tp_total],
+            device=self.device,
+        )
+        wp.launch(
+            _tp_bucket_finish_kernel,
+            dim=n_comp,
+            inputs=[self._tp_total],
+            outputs=[self._translation_coarse_rhs, self._translation_coarse_diag],
             device=self.device,
         )
         wp.launch(
