@@ -389,6 +389,12 @@ class Collision:
         # E3 triangle-level SDF contact. ``None`` = disabled; nothing is
         # allocated and no kernel is launched, so the default path is unchanged.
         self.tri_sdf_slot_shape = None
+        # T41: 三角形级位置投影（默认关）。开时 project_contacts_iteration 里的
+        # _tri_sdf_sweep 也在 compliant（力核）模式下运行，即「min_{x in tri} SDF >= h」
+        # 同时当位置约束和罚力用；反作用改读投影前的位置快照，否则压深被自己清成 0。
+        # OFF（默认）时下面每一处新增分支都取 False，代码路径与开关引入前逐位相同。
+        self.tri_sdf_projection = False
+        self.tri_sdf_pre_q = None
         self.tri_sdf_compliant = False
         # R16-A2': the shape meshes the exact query backend evaluates against.
         self.tri_sdf_meshes = None
@@ -1758,6 +1764,11 @@ class Collision:
         """
         if self.tri_sdf_slot_shape is None or not self.tri_sdf_compliant:
             return
+        # T41: with the triangle constraint ALSO solved as a position projection,
+        # `particle_q` as handed in has already had the overlap taken out of it,
+        # so k_tri * depth would read ~0. Read the pre-sweep snapshot instead.
+        if self.tri_sdf_projection and self.tri_sdf_pre_q is not None:
+            particle_q = self.tri_sdf_pre_q
         if self.tri_sdf_par and not self.tri_sdf_hold:
             self._t14_par_search(
                 particle_q, body_q, self.tri_sdf_slots * int(self.model.tri_count)
@@ -2584,9 +2595,31 @@ class Collision:
             f"max_corr={max_correction * 1000:g} mm",
             flush=True,
         )
+        # T41 开关：三角形级位置投影。与 fork 里 T15/T18/T31/T34/T36 同一套传统
+        # （import 时不生效、只在 enable 时读一次环境变量），所以 synreal 侧一行不用改。
+        # 不设 / 设 0 ⇒ self.tri_sdf_projection 保持 False ⇒ 下面三处分支全不进，
+        # OFF 路径与本开关引入前逐位相同（无新增 kernel launch、无新增分配）。
+        import os as _os
+
+        self.tri_sdf_projection = bool(int(_os.environ.get("T41_TRI_SDF_PROJECTION", "0")))
+        if self.tri_sdf_projection:
+            self.tri_sdf_pre_q = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=device)
+        print(
+            f"[T41] tri_sdf_projection={int(self.tri_sdf_projection)} "
+            f"(compliant={int(bool(self.tri_sdf_compliant))}, "
+            f"h={half_thickness * 1000:g} mm, max_corr={max_correction * 1000:g} mm, "
+            f"reaction reads {'PRE-projection snapshot' if self.tri_sdf_projection else 'particle_q as given'})",
+            flush=True,
+        )
 
     def _tri_sdf_sweep(self, particle_q: wp.array[wp.vec3], body_q: wp.array[wp.transform]):
         """One Jacobi sweep of the triangle-level SDF constraint."""
+        # T41: snapshot BEFORE this sweep moves anything. With the constraint run
+        # as a position projection, the overlap the compliant penalty needs is
+        # exactly what the sweep removes, so the reaction has to be read here
+        # instead (same argument as ``contact_projection_reaction_pre``).
+        if self.tri_sdf_projection and self.tri_sdf_pre_q is not None:
+            self.tri_sdf_pre_q.assign(particle_q)
         wp.launch(
             project_tri_sdf_kernel,
             dim=self.tri_sdf_slots * self.model.tri_count,
@@ -2727,7 +2760,12 @@ class Collision:
         # E3 triangle-level SDF constraint: an independent switch, so it can run
         # on the simplified stack (position projection off, E0c) without
         # dragging the particle-radius projection back in.
-        if self.tri_sdf_slot_shape is not None and not self.tri_sdf_compliant:
+        # T41: `or self.tri_sdf_projection` —— compliant 模式下也跑三角形级位置 sweep。
+        # OFF 时 (not True or False) == (not True)，逐位等价；非 compliant 时
+        # (True or X) == True，也逐位等价。
+        if self.tri_sdf_slot_shape is not None and (
+            not self.tri_sdf_compliant or self.tri_sdf_projection
+        ):
             # compliant mode carries the constraint as a force instead (see
             # accumulate_contact_force), so there is no position sweep here.
             self._tri_sdf_sweep(particle_q, body_q)
