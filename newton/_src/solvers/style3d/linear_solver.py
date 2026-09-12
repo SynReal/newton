@@ -6,6 +6,8 @@ from typing import Any
 
 import warp as wp
 
+from ...geometry import ParticleFlags
+
 
 @wp.struct
 class NonZeroEntry:
@@ -280,6 +282,237 @@ def step_cg_gated_kernel(
     x[i] = x[i] + alpha * p[i]
 
 
+# ------------------------------------------------------------------- FUSE1
+# Fused PCG inner loop (`pcg_fused=True`, default OFF -> stock path untouched).
+#
+# The stock loop launches, per PCG step:
+#     array_mul (z)                             [+ TP: 2 memsets + accumulate + apply]
+#     array_inner (rTz) -> update_cg_direction (p) -> ell_mat_vec (Ap)
+#     array_inner (pTAp) -> step_cg (x, r)
+# = 6 launches, 10 with the translation preconditioner.  All of them are pure
+# element-wise passes over `dim` particles plus two whole-array dot products;
+# at ~5 k particles each launch is latency, not work.
+#
+# A PCG step has exactly three GLOBAL dependencies, so three kernels is the
+# floor:
+#     (a) `p` complete before `Ap = A p`   (the ELL row reads neighbours)
+#     (b) `pTAp` complete before alpha     (reduction)
+#     (c) `rTz` complete before beta       (reduction)
+# Everything else folds into those three:
+#     K1  update_cg_direction_kernel (UNCHANGED)                    -> p
+#     K2  fused_mat_vec_pTAp_kernel  = ell_mat_vec + pTAp           -> Ap, pTAp
+#     K3  fused_step_z_kernel        = step_cg + array_mul + rTz    -> x, r, z, rTz
+#
+# With the translation preconditioner ON one more point appears -- the coarse
+# sums must be complete before the correction can be applied, and rTz is only
+# defined on the CORRECTED z:
+#     K3' fused_step_z_kernel   = step_cg + array_mul + TP accumulate
+#     K4  fused_tp_apply_kernel = TP apply + rTz
+# so TP costs ZERO extra launches per step on the fused path (4 vs 3), where
+# the stock path pays four (2 memsets + accumulate + apply).  The coarse
+# accumulators are re-zeroed by K2 (its threads with tid < n_comp), one kernel
+# ahead of the K3' that refills them, so no memset is needed inside the loop.
+#
+# NUMERICS.  Every element-wise expression below is copied verbatim, in the
+# same order, from the kernel it replaces, so the per-particle arithmetic is
+# bit-identical.  The two REDUCTIONS are not: `array_inner`'s C reduction is
+# replaced by `wp.atomic_add` into the same rTz/pTAp slot.  On CPU (warp's
+# serial backend) that is the same left-to-right sum; on GPU the summation
+# order is non-deterministic, so fused ON is neither bit-equal to fused OFF
+# nor bit-reproducible run to run.  Hence the flag defaults to OFF.
+#
+# Because the slots are accumulated instead of assigned, `solve()` zeroes
+# rTz/pTAp once per call (2 memsets against ~30 launches saved).
+#
+# NOT COMBINABLE with `linear_schedule="adaptive"` (ITER7) or
+# `tp_reduce="bucket"` (ITER7): both fall back to the stock loop, see
+# `PcgSolver.solve`.
+
+
+@wp.struct
+class FusedTranslationPrecond:
+    """Everything the legacy translation preconditioner needs, as one arg.
+
+    `enabled == 0` means "TP off": the array members are then never touched
+    (they are still bound, so the struct marshals the same way either way).
+    """
+
+    enabled: int
+    n_comp: int
+    dt: float
+    particle_component: wp.array[wp.int32]
+    particle_masses: wp.array[wp.float32]
+    particle_flags: wp.array[wp.int32]
+    contact_hessian_diags: wp.array[wp.mat33]
+    coarse_rhs: wp.array[wp.vec3]
+    coarse_diag: wp.array[wp.vec3]
+
+
+@wp.kernel
+def fused_z_kernel(
+    iter: int,
+    inv_M: wp.array[Any],
+    r: wp.array[wp.vec3],
+    tp: FusedTranslationPrecond,
+    # outputs
+    z: wp.array[wp.vec3],
+    rTz: wp.array[float],
+):
+    """PCG prologue: `array_mul_kernel` fused with either the rTz reduction
+    (TP off) or the TP coarse accumulation (TP on -- then `fused_tp_apply_kernel`
+    finishes rTz on the corrected z)."""
+    tid = wp.tid()
+    ri = r[tid]
+    zi = inv_M[tid] * ri
+    z[tid] = zi
+    if tp.enabled != 0:
+        # verbatim `_accumulate_translation_preconditioner_kernel`
+        if tp.particle_flags[tid] & ParticleFlags.ACTIVE:
+            comp_idx = wp.min(wp.max(tp.particle_component[tid], 0), tp.n_comp - 1)
+            mass_diag = tp.particle_masses[tid] / (tp.dt * tp.dt)
+            contact_hess = tp.contact_hessian_diags[tid]
+            wp.atomic_add(tp.coarse_rhs, comp_idx, ri)
+            wp.atomic_add(
+                tp.coarse_diag,
+                comp_idx,
+                wp.vec3(
+                    mass_diag + contact_hess[0, 0],
+                    mass_diag + contact_hess[1, 1],
+                    mass_diag + contact_hess[2, 2],
+                ),
+            )
+    else:
+        wp.atomic_add(rTz, iter, wp.dot(ri, zi))
+
+
+# Forward-declare instances of the generic kernel to support graph capture on CUDA <12.3 drivers
+wp.overload(fused_z_kernel, {"inv_M": wp.array[wp.float32]})
+wp.overload(fused_z_kernel, {"inv_M": wp.array[wp.mat33]})
+
+
+@wp.kernel
+def fused_tp_apply_kernel(
+    iter: int,
+    tp: FusedTranslationPrecond,
+    r: wp.array[wp.vec3],
+    # outputs
+    z: wp.array[wp.vec3],
+    rTz: wp.array[float],
+):
+    """`_apply_translation_preconditioner_kernel` fused with the rTz reduction.
+
+    rTz is the inner product over ALL particles (the stock `array_inner` does
+    not look at the ACTIVE flag), so the dot runs unconditionally on the final
+    value of z -- corrected for active particles, untouched for the rest.
+    """
+    tid = wp.tid()
+    comp_idx = wp.min(wp.max(tp.particle_component[tid], 0), tp.n_comp - 1)
+    denom = tp.coarse_diag[comp_idx]
+    rhs = tp.coarse_rhs[comp_idx]
+    zi = z[tid]
+    if tp.particle_flags[tid] & ParticleFlags.ACTIVE:
+        correction = wp.vec3(0.0)
+        if denom[0] > 0.0:
+            correction[0] = rhs[0] / denom[0]
+        if denom[1] > 0.0:
+            correction[1] = rhs[1] / denom[1]
+        if denom[2] > 0.0:
+            correction[2] = rhs[2] / denom[2]
+        zi = zi + correction
+        z[tid] = zi
+    wp.atomic_add(rTz, iter, wp.dot(r[tid], zi))
+
+
+@wp.kernel
+def fused_mat_vec_pTAp_kernel(
+    iter: int,
+    M_non_diag: SparseMatrixELL,
+    M_diag: wp.array[Any],
+    x: wp.array[wp.vec3],
+    additional_Mx: wp.array[wp.vec3],
+    use_additional: int,
+    tp: FusedTranslationPrecond,
+    # outputs
+    Mx: wp.array[wp.vec3],
+    pTAp: wp.array[float],
+):
+    """`ell_mat_vec_mul[_add]_kernel` + the pTAp reduction, and (TP on) the
+    re-zeroing of the coarse accumulators for the NEXT step's accumulate."""
+    tid = wp.tid()
+    xi = x[tid]
+    # `result` is declared before the branch (warp only merges mutations of
+    # variables that already exist).  Both association orders below are
+    # verbatim: (d*x + additional) + ell  /  (d*x) + ell.
+    result = M_diag[tid] * xi
+    if use_additional != 0:
+        result = result + additional_Mx[tid]
+        result = result + ell_mat_vec_mul(M_non_diag.num_nz, M_non_diag.nz_ell, x, tid)
+    else:
+        result = result + ell_mat_vec_mul(M_non_diag.num_nz, M_non_diag.nz_ell, x, tid)
+    Mx[tid] = result
+    wp.atomic_add(pTAp, iter, wp.dot(xi, result))
+    if tp.enabled != 0:
+        if tid < tp.n_comp:
+            tp.coarse_rhs[tid] = wp.vec3(0.0)
+            tp.coarse_diag[tid] = wp.vec3(0.0)
+
+
+# Forward-declare instances of the generic kernel to support graph capture on CUDA <12.3 drivers
+wp.overload(fused_mat_vec_pTAp_kernel, {"M_diag": wp.array[wp.float32]})
+wp.overload(fused_mat_vec_pTAp_kernel, {"M_diag": wp.array[wp.mat33]})
+
+
+@wp.kernel
+def fused_step_z_kernel(
+    iter: int,
+    rTz: wp.array[float],
+    pTAp: wp.array[float],
+    p: wp.array[wp.vec3],
+    Ap: wp.array[wp.vec3],
+    inv_M: wp.array[Any],
+    tp: FusedTranslationPrecond,
+    # outputs
+    x: wp.array[wp.vec3],
+    r: wp.array[wp.vec3],
+    z: wp.array[wp.vec3],
+):
+    """`step_cg_kernel` + `array_mul_kernel` for the NEXT step's z, fused with
+    either that step's rTz reduction (TP off) or the TP coarse accumulation."""
+    i = wp.tid()
+    num = rTz[iter]
+    denom = pTAp[iter]
+    alpha = wp.float32(0.0)
+    if (wp.abs(denom) > 1.0e-30) and (not wp.isnan(denom)) and (not wp.isnan(num)):
+        alpha = num / denom
+    ri = r[i] - alpha * Ap[i]
+    r[i] = ri
+    x[i] = x[i] + alpha * p[i]
+    zi = inv_M[i] * ri
+    z[i] = zi
+    if tp.enabled != 0:
+        if tp.particle_flags[i] & ParticleFlags.ACTIVE:
+            comp_idx = wp.min(wp.max(tp.particle_component[i], 0), tp.n_comp - 1)
+            mass_diag = tp.particle_masses[i] / (tp.dt * tp.dt)
+            contact_hess = tp.contact_hessian_diags[i]
+            wp.atomic_add(tp.coarse_rhs, comp_idx, ri)
+            wp.atomic_add(
+                tp.coarse_diag,
+                comp_idx,
+                wp.vec3(
+                    mass_diag + contact_hess[0, 0],
+                    mass_diag + contact_hess[1, 1],
+                    mass_diag + contact_hess[2, 2],
+                ),
+            )
+    else:
+        wp.atomic_add(rTz, iter + 1, wp.dot(ri, zi))
+
+
+# Forward-declare instances of the generic kernel to support graph capture on CUDA <12.3 drivers
+wp.overload(fused_step_z_kernel, {"inv_M": wp.array[wp.float32]})
+wp.overload(fused_step_z_kernel, {"inv_M": wp.array[wp.mat33]})
+
+
 @wp.kernel
 def generate_test_data_kernel(
     dim: int,
@@ -351,10 +584,13 @@ class PcgSolver:
             3. Matrix-free diagonals: wp.array(wp.mat3x3)
     """
 
-    def __init__(self, dim: int, device, maxIter: int = 999):
+    def __init__(self, dim: int, device, maxIter: int = 999, fused: bool = False):
         self.dim = dim  # pre-allocation
         self.device = device
         self.maxIter = maxIter
+        # FUSE1: fuse the per-step element-wise kernels (default OFF).
+        self.fused = bool(fused)
+        self._fused_tp_off = None  # lazily built `enabled=0` struct
         self.r = wp.array(shape=dim, dtype=wp.vec3, device=device)
         self.z = wp.array(shape=dim, dtype=wp.vec3, device=device)
         self.p = wp.array(shape=dim, dtype=wp.vec3, device=device)
@@ -479,6 +715,7 @@ class PcgSolver:
         additional_multiplier: Callable | None = None,
         preconditioner: Callable | None = None,
         eta: float = 0.0,
+        fused_tp=None,
     ):
         # Prevent out-of-bounds in rTz/pTAp when iterations > maxIter.
         iterations = wp.min(iterations, self.maxIter)
@@ -496,6 +733,14 @@ class PcgSolver:
         else:
             additional_Ax = additional_multiplier(x0) if x0 is not None else None
             self.step1_update_r(A_non_diag, A_diag, b, x0, additional_Ax)
+
+        # FUSE1: the fused loop needs the TP data as a struct, so a caller
+        # that supplies a `preconditioner` callable but no `fused_tp`
+        # (tp_reduce="bucket") falls back; `adaptive` (ITER7) also falls back
+        # because its device-side gate lives on the un-fused kernels.
+        if self.fused and not adaptive and (preconditioner is None or fused_tp is not None):
+            self._fused_loop(A_non_diag, A_diag, inv_M, x1, iterations, additional_multiplier, fused_tp)
+            return
 
         for iter in range(iterations):
             self.step2_update_z(inv_M)
@@ -535,6 +780,88 @@ class PcgSolver:
                 outputs=[self.pcg_steps_hist],
                 device=self.device,
             )
+
+    # ------------------------------------------------------------- FUSE1
+    def _fused_loop(self, A_non_diag, A_diag, inv_M, x1, iterations, additional_multiplier, fused_tp):
+        """3 launches per PCG step (4 with the translation preconditioner).
+
+        Entry contract: `self.r` already holds the initial residual.  See the
+        FUSE1 block above `FusedTranslationPrecond` for the dependency argument
+        and the numerics caveat (the two reductions become atomics).
+        """
+        if fused_tp is None:
+            if self._fused_tp_off is None:
+                self._fused_tp_off = FusedTranslationPrecond()
+                self._fused_tp_off.enabled = 0
+                self._fused_tp_off.n_comp = 0
+                self._fused_tp_off.dt = 0.0
+            tp = self._fused_tp_off
+        else:
+            tp = fused_tp
+        tp_on = int(tp.enabled) != 0
+
+        # rTz / pTAp are now ACCUMULATED into, not assigned -- 2 memsets per
+        # solve against ~3 launches per step saved.
+        self.rTz.zero_()
+        self.pTAp.zero_()
+
+        # Prologue: z (+ rTz[0], or the TP coarse sums finished by K4).
+        wp.launch(
+            fused_z_kernel,
+            dim=self.dim,
+            inputs=[0, inv_M, self.r, tp],
+            outputs=[self.z, self.rTz],
+            device=self.device,
+        )
+        if tp_on:
+            wp.launch(
+                fused_tp_apply_kernel,
+                dim=self.dim,
+                inputs=[0, tp, self.r],
+                outputs=[self.z, self.rTz],
+                device=self.device,
+            )
+
+        for iter in range(iterations):
+            self.step4_update_p(iter)
+
+            additional_Ap = None if additional_multiplier is None else additional_multiplier(self.p)
+            wp.launch(
+                fused_mat_vec_pTAp_kernel,
+                dim=self.dim,
+                inputs=[
+                    iter,
+                    A_non_diag,
+                    A_diag,
+                    self.p,
+                    # unread when use_additional == 0; bind a live array anyway
+                    self.p if additional_Ap is None else additional_Ap,
+                    0 if additional_Ap is None else 1,
+                    tp,
+                ],
+                outputs=[self.Ap, self.pTAp],
+                device=self.device,
+            )
+
+            if iter + 1 >= iterations:
+                # Last step: nobody reads z / rTz again, so use the stock kernel.
+                self.step7_update_x_r(x1, iter)
+            else:
+                wp.launch(
+                    fused_step_z_kernel,
+                    dim=self.dim,
+                    inputs=[iter, self.rTz, self.pTAp, self.p, self.Ap, inv_M, tp],
+                    outputs=[x1, self.r, self.z],
+                    device=self.device,
+                )
+                if tp_on:
+                    wp.launch(
+                        fused_tp_apply_kernel,
+                        dim=self.dim,
+                        inputs=[iter + 1, tp, self.r],
+                        outputs=[self.z, self.rTz],
+                        device=self.device,
+                    )
 
 
 if __name__ == "__main__":

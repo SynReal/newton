@@ -37,7 +37,7 @@ from .kernels import (
     prepare_jacobi_preconditioner_no_contact_hessian_kernel,
     update_velocity,
 )
-from .linear_solver import PcgSolver, SparseMatrixELL
+from .linear_solver import FusedTranslationPrecond, PcgSolver, SparseMatrixELL
 
 AttributeAssignment = Model.AttributeAssignment
 AttributeFrequency = Model.AttributeFrequency
@@ -501,6 +501,7 @@ class SolverStyle3D(SolverBase):
         linear_schedule: str | None = None,
         tp_reduce: str = "legacy",
         pcg_eta: float = 0.1,
+        pcg_fused: bool = False,
         inertia_warm_start: bool | str = False,
         coarse_correction: int = 0,
         inertia_warm_start_v_gate: float = 0.05,
@@ -598,7 +599,11 @@ class SolverStyle3D(SolverBase):
         self.drag_spring_stiff = drag_spring_stiff
         self.enable_mouse_dragging = enable_mouse_dragging
         self.enable_translation_preconditioner = enable_translation_preconditioner
-        self.linear_solver = PcgSolver(model.particle_count, self.device)
+        # FUSE1: `pcg_fused` collapses the PCG step's element-wise kernels
+        # (and, when the translation preconditioner is on, its two kernels) to
+        # 3-4 launches per step.  Default OFF -> the stock path is untouched.
+        self.pcg_fused = bool(pcg_fused)
+        self.linear_solver = PcgSolver(model.particle_count, self.device, fused=self.pcg_fused)
 
         # Fixed PD matrix
         self.pd_non_diags = SparseMatrixELL()
@@ -669,6 +674,17 @@ class SolverStyle3D(SolverBase):
         if str(tp_reduce) not in ("legacy", "bucket"):
             raise ValueError(f"tp_reduce must be 'legacy' or 'bucket', got {tp_reduce!r}")
         self.tp_reduce = str(tp_reduce)
+        # FUSE1: rebuilt (dt / contact Hessian) once per `solve()`.
+        self._fused_tp = FusedTranslationPrecond()
+        self._fused_tp.enabled = 0
+        self._fused_tp.n_comp = int(self._translation_component_count)
+        self._fused_tp.dt = 0.0
+        self._fused_tp.particle_component = self._translation_particle_component
+        self._fused_tp.particle_masses = model.particle_mass
+        self._fused_tp.particle_flags = model.particle_flags
+        self._fused_tp.contact_hessian_diags = self._translation_zero_contact_hessian
+        self._fused_tp.coarse_rhs = self._translation_coarse_rhs
+        self._fused_tp.coarse_diag = self._translation_coarse_diag
         self.pcg_eta = float(pcg_eta)
         # `adaptive` is the ONLY schedule that arms the PCG stop test; every other
         # schedule passes eta = 0 into PcgSolver.solve and keeps the historical
@@ -877,12 +893,12 @@ class SolverStyle3D(SolverBase):
         """The one ``[ITER3]`` self-provenance line every run must print."""
         return ("[ITER3] coarse_correction=%d linear_schedule=%s tp=%s "
                 "linear_iterations=%d nonlinear_iterations=%d components=%d "
-                "tp_reduce=%s pcg_eta=%.4g"
+                "tp_reduce=%s pcg_eta=%.4g pcg_fused=%d"
                 % (self.coarse_correction, self.linear_schedule,
                    bool(self.enable_translation_preconditioner),
                    int(self.linear_iterations), int(self.nonlinear_iterations),
                    int(self._translation_component_count),
-                   self.tp_reduce, self._pcg_eta_active))
+                   self.tp_reduce, self._pcg_eta_active, int(self.pcg_fused)))
 
     # ------------------------------------------------------------- ITER2
     def _iter2_mark_contact_gate(self, state_in: State, state_out: State,
@@ -1288,6 +1304,8 @@ class SolverStyle3D(SolverBase):
                     self._apply_translation_preconditioner,
                     # ITER7: 0.0 for every schedule but "adaptive".
                     self._pcg_eta_active,
+                    # FUSE1: None unless `pcg_fused` (and a fusable TP mode).
+                    self._fused_tp_args(),
                 )
             else:
                 self.linear_solver.solve(
@@ -1310,6 +1328,8 @@ class SolverStyle3D(SolverBase):
                     None,
                     # ITER7: 0.0 for every schedule but "adaptive".
                     self._pcg_eta_active,
+                    # FUSE1: None unless `pcg_fused`.
+                    self._fused_tp_args(),
                 )
 
             if self.collision is not None:
@@ -1398,6 +1418,31 @@ class SolverStyle3D(SolverBase):
             component = component_map.setdefault(root, len(component_map))
             particle_component[particle] = component
         return max(1, len(component_map)), particle_component
+
+    def _fused_tp_args(self):
+        """FUSE1: the struct the fused PCG kernels need, or ``None`` when the
+        fused path must fall back to the stock loop.
+
+        Returns ``None`` for ``tp_reduce="bucket"`` (its two-level reduction is
+        not fused) and whenever ``pcg_fused`` is off.  With TP off it returns an
+        ``enabled=0`` struct, which still takes the fused path.
+        """
+        if not self.pcg_fused:
+            return None
+        tp = self._fused_tp
+        if not self.enable_translation_preconditioner:
+            tp.enabled = 0
+            return tp
+        if self.tp_reduce != "legacy":
+            return None
+        tp.enabled = 1
+        tp.dt = self._translation_preconditioner_dt
+        tp.contact_hessian_diags = self._translation_contact_hessian_diags
+        # The in-loop re-zero is done by `fused_mat_vec_pTAp_kernel`; only the
+        # prologue's accumulate needs a memset here (2 per solve, not per step).
+        self._translation_coarse_rhs.zero_()
+        self._translation_coarse_diag.zero_()
+        return tp
 
     def _apply_translation_preconditioner(self, residual: wp.array[wp.vec3], z: wp.array[wp.vec3]) -> None:
         # ITER7: "bucket" replaces the single-slot atomic accumulation with the
