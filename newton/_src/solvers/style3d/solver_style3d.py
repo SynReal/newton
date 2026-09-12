@@ -37,7 +37,7 @@ from .kernels import (
     prepare_jacobi_preconditioner_no_contact_hessian_kernel,
     update_velocity,
 )
-from .linear_solver import FusedTranslationPrecond, PcgSolver, SparseMatrixELL
+from .linear_solver import FUSE_BUCKETS, FusedTranslationPrecond, PcgSolver, SparseMatrixELL
 
 AttributeAssignment = Model.AttributeAssignment
 AttributeFrequency = Model.AttributeFrequency
@@ -893,12 +893,13 @@ class SolverStyle3D(SolverBase):
         """The one ``[ITER3]`` self-provenance line every run must print."""
         return ("[ITER3] coarse_correction=%d linear_schedule=%s tp=%s "
                 "linear_iterations=%d nonlinear_iterations=%d components=%d "
-                "tp_reduce=%s pcg_eta=%.4g pcg_fused=%d"
+                "tp_reduce=%s pcg_eta=%.4g pcg_fused=%d pcg_buckets=%d"
                 % (self.coarse_correction, self.linear_schedule,
                    bool(self.enable_translation_preconditioner),
                    int(self.linear_iterations), int(self.nonlinear_iterations),
                    int(self._translation_component_count),
-                   self.tp_reduce, self._pcg_eta_active, int(self.pcg_fused)))
+                   self.tp_reduce, self._pcg_eta_active, int(self.pcg_fused),
+                   int(FUSE_BUCKETS)))
 
     # ------------------------------------------------------------- ITER2
     def _iter2_mark_contact_gate(self, state_in: State, state_out: State,

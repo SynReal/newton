@@ -299,9 +299,9 @@ def step_cg_gated_kernel(
 #     (b) `pTAp` complete before alpha     (reduction)
 #     (c) `rTz` complete before beta       (reduction)
 # Everything else folds into those three:
-#     K1  update_cg_direction_kernel (UNCHANGED)                    -> p
-#     K2  fused_mat_vec_pTAp_kernel  = ell_mat_vec + pTAp           -> Ap, pTAp
-#     K3  fused_step_z_kernel        = step_cg + array_mul + rTz    -> x, r, z, rTz
+#     K1  fused_update_p_kernel      = update_cg_direction + rTz bucket sum -> p
+#     K2  fused_mat_vec_pTAp_kernel  = ell_mat_vec + pTAp                   -> Ap, pTAp
+#     K3  fused_step_z_kernel        = step_cg + array_mul + rTz            -> x, r, z, rTz
 #
 # With the translation preconditioner ON one more point appears -- the coarse
 # sums must be complete before the correction can be applied, and rTz is only
@@ -313,20 +313,69 @@ def step_cg_gated_kernel(
 # accumulators are re-zeroed by K2 (its threads with tid < n_comp), one kernel
 # ahead of the K3' that refills them, so no memset is needed inside the loop.
 #
+# ------------------------------------------------------------------- FUSE2
+# THE REDUCTIONS ARE TWO-LEVEL (`pcg_fused_buckets`, default 32).
+#
+# FUSE1 replaced `array_inner` with a single-address `wp.atomic_add`.  That is
+# free at 5 k particles but serialises with N: measured on one H20, a
+# single-address atomic dot costs 13.7 us at 4.7 k, 18.1 at 9.4 k, 37.2 at
+# 20.3 k and 177 at 100 k, while `array_inner`'s tree reduction is a flat
+# 10 us.  So FUSE1 won on silk/tshirt and LOST 4-8 % on the 20 k bag.
+#
+# FUSE2 keeps the three-kernel shape and kills the contention instead:
+#   level 1  each thread atomically adds into bucket `tid % FUSE_BUCKETS` of a
+#            [iteration, nb] scratch row -> contention drops by nb;
+#   level 2  the CONSUMER kernel sums those nb floats itself, redundantly, in
+#            every thread (`_fused_bucket_sum`).  nb broadcast loads out of L1
+#            are far cheaper than an extra kernel launch, so the launch count
+#            is unchanged -- still 3 per step (4 with TP).
+# `pcg_fused_buckets=1` reproduces FUSE1's single-address behaviour exactly and
+# is kept as the A/B arm.
+#
+# The stock `update_cg_direction_kernel` is NOT touched: the bucket sum lives
+# in a new `fused_update_p_kernel` (K1 above), so the unfused path keeps its
+# kernels byte-for-byte.  ITER7's `adaptive` gate kernels are not touched
+# either -- `adaptive` and `pcg_fused` do not combine (see `PcgSolver.solve`),
+# so the gate keeps reading the 1-D `rTz` that the unfused loop still writes.
+#
 # NUMERICS.  Every element-wise expression below is copied verbatim, in the
 # same order, from the kernel it replaces, so the per-particle arithmetic is
-# bit-identical.  The two REDUCTIONS are not: `array_inner`'s C reduction is
-# replaced by `wp.atomic_add` into the same rTz/pTAp slot.  On CPU (warp's
-# serial backend) that is the same left-to-right sum; on GPU the summation
-# order is non-deterministic, so fused ON is neither bit-equal to fused OFF
-# nor bit-reproducible run to run.  Hence the flag defaults to OFF.
+# bit-identical.  Only the two REDUCTIONS differ: the summation order changes
+# (atomics within a bucket race; the bucket-to-scalar sum is a fixed 0..nb-1
+# loop).  So fused ON is neither bit-equal to fused OFF nor bit-reproducible
+# run to run on GPU.  Hence the flag defaults to OFF.
 #
-# Because the slots are accumulated instead of assigned, `solve()` zeroes
-# rTz/pTAp once per call (2 memsets against ~30 launches saved).
-#
-# NOT COMBINABLE with `linear_schedule="adaptive"` (ITER7) or
-# `tp_reduce="bucket"` (ITER7): both fall back to the stock loop, see
-# `PcgSolver.solve`.
+# Because the slots are accumulated instead of assigned, `solve()` zeroes the
+# two bucket scratch arrays once per call (2 memsets against ~30 launches
+# saved).
+
+
+# Level-1 bucket count.  COMPILE-TIME on purpose, twice over:
+#   * `tid % FUSE_BUCKETS` becomes a bitwise AND instead of an integer divide,
+#     and the kernels lose an argument -- measured, a runtime bucket count cost
+#     +0.32 ms/substep on silk_4k (~8 us per PCG step);
+#   * `_fused_bucket_sum` unrolls (a dynamic 32-trip sum costs +2.15 us over
+#     the element-wise floor, an unrolled one +0.93 us, and two unrolled sums
+#     then cost the same as one).
+# 8 is the measured optimum on one H20 (pure-cloth bench, `prod` arm, 500
+# substeps x 3): bag 20 k particles  nb=1 25.98 / nb=4 20.52 / nb=8 19.00 /
+# nb=32 20.02 ms per substep;  silk 4.7 k is flat (8.52-8.64) across all four,
+# so nothing is lost at the small end.  Changing it is a recompile, not a knob.
+FUSE_BUCKETS = wp.constant(8)
+
+
+@wp.func
+def _fused_bucket_sum(buckets: wp.array2d(dtype=float), row: int):
+    """Level-2 reduction: sum one row of the bucket scratch, in a fixed order.
+
+    Run redundantly by every thread of the consumer kernel -- 32 broadcast
+    loads out of L1, which is what buys back the kernel launch this would
+    otherwise cost.
+    """
+    s = float(0.0)
+    for k in range(FUSE_BUCKETS):
+        s += buckets[row, k]
+    return s
 
 
 @wp.struct
@@ -356,7 +405,7 @@ def fused_z_kernel(
     tp: FusedTranslationPrecond,
     # outputs
     z: wp.array[wp.vec3],
-    rTz: wp.array[float],
+    rTz_b: wp.array2d(dtype=float),
 ):
     """PCG prologue: `array_mul_kernel` fused with either the rTz reduction
     (TP off) or the TP coarse accumulation (TP on -- then `fused_tp_apply_kernel`
@@ -382,7 +431,7 @@ def fused_z_kernel(
                 ),
             )
     else:
-        wp.atomic_add(rTz, iter, wp.dot(ri, zi))
+        wp.atomic_add(rTz_b, iter, tid % FUSE_BUCKETS, wp.dot(ri, zi))
 
 
 # Forward-declare instances of the generic kernel to support graph capture on CUDA <12.3 drivers
@@ -397,7 +446,7 @@ def fused_tp_apply_kernel(
     r: wp.array[wp.vec3],
     # outputs
     z: wp.array[wp.vec3],
-    rTz: wp.array[float],
+    rTz_b: wp.array2d(dtype=float),
 ):
     """`_apply_translation_preconditioner_kernel` fused with the rTz reduction.
 
@@ -420,7 +469,34 @@ def fused_tp_apply_kernel(
             correction[2] = rhs[2] / denom[2]
         zi = zi + correction
         z[tid] = zi
-    wp.atomic_add(rTz, iter, wp.dot(r[tid], zi))
+    wp.atomic_add(rTz_b, iter, tid % FUSE_BUCKETS, wp.dot(r[tid], zi))
+
+
+@wp.kernel
+def fused_update_p_kernel(
+    iter: int,
+    z: wp.array[wp.vec3],
+    rTz_b: wp.array2d(dtype=float),
+    p_prev: wp.array[wp.vec3],
+    # outputs
+    p: wp.array[wp.vec3],
+):
+    """`update_cg_direction_kernel` with beta taken from the bucket scratch.
+
+    The stock kernel is left untouched for the unfused path; this is the only
+    difference between the two (`num`/`denom` come from `_fused_bucket_sum`
+    instead of the 1-D `rTz`).
+    """
+    i = wp.tid()
+    new_p = z[i]
+    if iter > 0:
+        num = _fused_bucket_sum(rTz_b, iter)
+        denom = _fused_bucket_sum(rTz_b, iter - 1)
+        beta = wp.float32(0.0)
+        if (wp.abs(denom) > 1.0e-30) and (not wp.isnan(denom)) and (not wp.isnan(num)):
+            beta = num / denom
+        new_p += beta * p_prev[i]
+    p[i] = new_p
 
 
 @wp.kernel
@@ -434,7 +510,7 @@ def fused_mat_vec_pTAp_kernel(
     tp: FusedTranslationPrecond,
     # outputs
     Mx: wp.array[wp.vec3],
-    pTAp: wp.array[float],
+    pTAp_b: wp.array2d(dtype=float),
 ):
     """`ell_mat_vec_mul[_add]_kernel` + the pTAp reduction, and (TP on) the
     re-zeroing of the coarse accumulators for the NEXT step's accumulate."""
@@ -450,7 +526,7 @@ def fused_mat_vec_pTAp_kernel(
     else:
         result = result + ell_mat_vec_mul(M_non_diag.num_nz, M_non_diag.nz_ell, x, tid)
     Mx[tid] = result
-    wp.atomic_add(pTAp, iter, wp.dot(xi, result))
+    wp.atomic_add(pTAp_b, iter, tid % FUSE_BUCKETS, wp.dot(xi, result))
     if tp.enabled != 0:
         if tid < tp.n_comp:
             tp.coarse_rhs[tid] = wp.vec3(0.0)
@@ -465,8 +541,9 @@ wp.overload(fused_mat_vec_pTAp_kernel, {"M_diag": wp.array[wp.mat33]})
 @wp.kernel
 def fused_step_z_kernel(
     iter: int,
-    rTz: wp.array[float],
-    pTAp: wp.array[float],
+    do_next: int,
+    rTz_b: wp.array2d(dtype=float),
+    pTAp_b: wp.array2d(dtype=float),
     p: wp.array[wp.vec3],
     Ap: wp.array[wp.vec3],
     inv_M: wp.array[Any],
@@ -477,16 +554,22 @@ def fused_step_z_kernel(
     z: wp.array[wp.vec3],
 ):
     """`step_cg_kernel` + `array_mul_kernel` for the NEXT step's z, fused with
-    either that step's rTz reduction (TP off) or the TP coarse accumulation."""
+    either that step's rTz reduction (TP off) or the TP coarse accumulation.
+
+    `do_next == 0` on the LAST PCG step: nobody reads z / rTz again, so only
+    x and r are updated (and rTz[iter+1] is never indexed out of range).
+    """
     i = wp.tid()
-    num = rTz[iter]
-    denom = pTAp[iter]
+    num = _fused_bucket_sum(rTz_b, iter)
+    denom = _fused_bucket_sum(pTAp_b, iter)
     alpha = wp.float32(0.0)
     if (wp.abs(denom) > 1.0e-30) and (not wp.isnan(denom)) and (not wp.isnan(num)):
         alpha = num / denom
     ri = r[i] - alpha * Ap[i]
     r[i] = ri
     x[i] = x[i] + alpha * p[i]
+    if do_next == 0:
+        return
     zi = inv_M[i] * ri
     z[i] = zi
     if tp.enabled != 0:
@@ -505,7 +588,7 @@ def fused_step_z_kernel(
                 ),
             )
     else:
-        wp.atomic_add(rTz, iter + 1, wp.dot(ri, zi))
+        wp.atomic_add(rTz_b, iter + 1, i % FUSE_BUCKETS, wp.dot(ri, zi))
 
 
 # Forward-declare instances of the generic kernel to support graph capture on CUDA <12.3 drivers
@@ -591,6 +674,13 @@ class PcgSolver:
         # FUSE1: fuse the per-step element-wise kernels (default OFF).
         self.fused = bool(fused)
         self._fused_tp_off = None  # lazily built `enabled=0` struct
+        # FUSE2: level-1 bucket scratch for the two dot products.
+        if self.fused:
+            self.rTz_b = wp.zeros((maxIter, int(FUSE_BUCKETS)), dtype=float, device=device)
+            self.pTAp_b = wp.zeros((maxIter, int(FUSE_BUCKETS)), dtype=float, device=device)
+        else:
+            self.rTz_b = None
+            self.pTAp_b = None
         self.r = wp.array(shape=dim, dtype=wp.vec3, device=device)
         self.z = wp.array(shape=dim, dtype=wp.vec3, device=device)
         self.p = wp.array(shape=dim, dtype=wp.vec3, device=device)
@@ -800,17 +890,17 @@ class PcgSolver:
             tp = fused_tp
         tp_on = int(tp.enabled) != 0
 
-        # rTz / pTAp are now ACCUMULATED into, not assigned -- 2 memsets per
-        # solve against ~3 launches per step saved.
-        self.rTz.zero_()
-        self.pTAp.zero_()
+        # FUSE2: the bucket rows are ACCUMULATED into, not assigned -- 2 memsets
+        # per solve against ~3 launches per step saved.
+        self.rTz_b.zero_()
+        self.pTAp_b.zero_()
 
         # Prologue: z (+ rTz[0], or the TP coarse sums finished by K4).
         wp.launch(
             fused_z_kernel,
             dim=self.dim,
             inputs=[0, inv_M, self.r, tp],
-            outputs=[self.z, self.rTz],
+            outputs=[self.z, self.rTz_b],
             device=self.device,
         )
         if tp_on:
@@ -818,12 +908,18 @@ class PcgSolver:
                 fused_tp_apply_kernel,
                 dim=self.dim,
                 inputs=[0, tp, self.r],
-                outputs=[self.z, self.rTz],
+                outputs=[self.z, self.rTz_b],
                 device=self.device,
             )
 
         for iter in range(iterations):
-            self.step4_update_p(iter)
+            wp.launch(
+                fused_update_p_kernel,
+                dim=self.dim,
+                inputs=[iter, self.z, self.rTz_b, self.p],
+                outputs=[self.p],
+                device=self.device,
+            )
 
             additional_Ap = None if additional_multiplier is None else additional_multiplier(self.p)
             wp.launch(
@@ -839,29 +935,27 @@ class PcgSolver:
                     0 if additional_Ap is None else 1,
                     tp,
                 ],
-                outputs=[self.Ap, self.pTAp],
+                outputs=[self.Ap, self.pTAp_b],
                 device=self.device,
             )
 
-            if iter + 1 >= iterations:
-                # Last step: nobody reads z / rTz again, so use the stock kernel.
-                self.step7_update_x_r(x1, iter)
-            else:
+            last = 1 if iter + 1 >= iterations else 0
+            wp.launch(
+                fused_step_z_kernel,
+                dim=self.dim,
+                inputs=[iter, 0 if last else 1, self.rTz_b, self.pTAp_b,
+                        self.p, self.Ap, inv_M, tp],
+                outputs=[x1, self.r, self.z],
+                device=self.device,
+            )
+            if tp_on and not last:
                 wp.launch(
-                    fused_step_z_kernel,
+                    fused_tp_apply_kernel,
                     dim=self.dim,
-                    inputs=[iter, self.rTz, self.pTAp, self.p, self.Ap, inv_M, tp],
-                    outputs=[x1, self.r, self.z],
+                    inputs=[iter + 1, tp, self.r],
+                    outputs=[self.z, self.rTz_b],
                     device=self.device,
                 )
-                if tp_on:
-                    wp.launch(
-                        fused_tp_apply_kernel,
-                        dim=self.dim,
-                        inputs=[iter + 1, tp, self.r],
-                        outputs=[self.z, self.rTz],
-                        device=self.device,
-                    )
 
 
 if __name__ == "__main__":
