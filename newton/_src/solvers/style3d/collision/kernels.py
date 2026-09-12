@@ -322,6 +322,21 @@ _T15_SDF_GX_RING = wp.constant(int(__import__("os").environ.get("T15_SDF_GX_RING
 # 0 = OFF: the strict ``<`` this file always used, bit-identical.
 _T16_SDF_ARGMIN_TOL = wp.constant(float(__import__("os").environ.get("T16_SDF_ARGMIN_TOL", "0")))
 
+# T42-A 两段式三角形级投影（默认 0 = OFF，codegen 级逐位：常量为 0 时下面每个
+# `if _T42_TRI_DEEP_ONLY > 0.0` 都被折叠掉，生成的 PTX 与本开关引入前相同）。
+#
+# T41b 实测：三角形级位置投影（`tri_sdf_projection`）把「min_{x in tri} SDF >= h」
+# 当**位置约束**解，于是常规夹持压深（0.5-1.3 mm）也被投影推到壳外，力核下一次迭代
+# 读到的压深 -> 0，摩擦 mu*N 与 T8 锚一起 -> 0，抬臂 25-50 mm 布就从钳口滑出
+# （末帧钳口 4/4 = 0 mm²）。
+#
+# 两段式把投影降级成**只在主力层漏了才干活的保险**：
+#   浅于阈值（三角形最深点 SDF >= -d_deep）—— 一律不动，力核一字不改；
+#   深于阈值 —— 把该三角形沿最深点的 SDF 梯度拉回到 SDF = **-d_deep**（不是拉到壳外），
+#               所以残余压深恒为 d_deep，力核照常在这个压深上出法向力与摩擦。
+# d_deep 单位 mm，本批取 0.5 mm（= 壳厚 h），即「真穿过刀面 0.5 mm 以上才动」。
+_T42_TRI_DEEP_ONLY = wp.constant(float(__import__("os").environ.get("T42_TRI_DEEP_ONLY_MM", "0")) * 1.0e-3)
+
 # T16 SOFT: make the choice of contact point CONTINUOUS instead of a switch.
 #
 # ``_T16_SDF_ARGMIN_TOL`` removed the coin flip but replaced it with a THRESHOLD:
@@ -2630,12 +2645,17 @@ def project_tri_sdf_kernel(
                     w = cand
         step = step * 0.5
 
-    if best >= half_thickness:
+    # T42-A: two-stage. OFF (constant 0) folds away -> `target = half_thickness`,
+    # i.e. bit-identical to the single-stage form this kernel always had.
+    target = half_thickness
+    if _T42_TRI_DEEP_ONLY > 0.0:
+        target = -_T42_TRI_DEEP_ONLY
+    if best >= target:
         return
 
     p = a * w[0] + b * w[1] + c * w[2]
     n_local = sdf_grid_gradient(sdf, base, nx, ny, nz, org, inv_voxel, bg, voxel, p)
-    push = wp.min(half_thickness - best, max_correction)
+    push = wp.min(target - best, max_correction)
     n_world = wp.transform_vector(X_ws, n_local)
     denom = w[0] * w[0] + w[1] * w[1] + w[2] * w[2]
     scale = push / wp.max(denom, 1.0e-6)

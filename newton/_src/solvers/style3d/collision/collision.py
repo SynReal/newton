@@ -395,6 +395,9 @@ class Collision:
         # OFF（默认）时下面每一处新增分支都取 False，代码路径与开关引入前逐位相同。
         self.tri_sdf_projection = False
         self.tri_sdf_pre_q = None
+        # T42-B: 力核（eval_tri_sdf_contact_kernel）的压深也读投影前快照，与
+        # accumulate_tri_sdf_reaction 同一口径。默认关。
+        self.tri_sdf_force_pre_q = False
         self.tri_sdf_compliant = False
         # R16-A2': the shape meshes the exact query backend evaluates against.
         self.tri_sdf_meshes = None
@@ -1448,11 +1451,17 @@ class Collision:
                     with _t14_prof.section("tri_sdf_force"
                                           if _hold_mode != 2
                                           else "tri_sdf_force_held"):
+                        # T42-B: the FORCE reads the pre-projection snapshot, same
+                        # way the reaction does. Candidates / broad-phase stay on the
+                        # current positions; only the depth the penalty sees changes.
+                        _t42_force_q = state_out.particle_q
+                        if self.tri_sdf_force_pre_q and self.tri_sdf_pre_q is not None:
+                            _t42_force_q = self.tri_sdf_pre_q
                         wp.launch(
                             eval_tri_sdf_contact_kernel,
                             dim=_bp_dim,
                             inputs=[
-                                state_out.particle_q,
+                                _t42_force_q,
                                 self.model.tri_indices,
                                 int(self.model.tri_count),
                                 self.tri_sdf_stiffness,
@@ -2602,8 +2611,18 @@ class Collision:
         import os as _os
 
         self.tri_sdf_projection = bool(int(_os.environ.get("T41_TRI_SDF_PROJECTION", "0")))
+        # T42-B（默认关）：力核也读投影前快照。只有在投影本身开着时才有意义。
+        self.tri_sdf_force_pre_q = bool(int(_os.environ.get("T42_TRI_FORCE_PRE_Q", "0")))
         if self.tri_sdf_projection:
-            self.tri_sdf_pre_q = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=device)
+            # 初值 = 当前位置，不是 0：力核可能在第一次 sweep 之前就读它。
+            self.tri_sdf_pre_q = wp.clone(self.model.particle_q)
+        _t42_deep = float(_os.environ.get("T42_TRI_DEEP_ONLY_MM", "0"))
+        print(
+            f"[T42] tri_deep_only_mm={_t42_deep:g} force_pre_q={int(self.tri_sdf_force_pre_q)}"
+            + ("  (两段式：浅于阈值不动、深于阈值拉回到 SDF = -d_deep)" if _t42_deep > 0 else "")
+            + ("  (力核压深读投影前快照)" if self.tri_sdf_force_pre_q else ""),
+            flush=True,
+        )
         print(
             f"[T41] tri_sdf_projection={int(self.tri_sdf_projection)} "
             f"(compliant={int(bool(self.tri_sdf_compliant))}, "
