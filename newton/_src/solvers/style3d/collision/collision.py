@@ -1758,7 +1758,9 @@ class Collision:
 
         mode = int(os.environ.get("T52_TRI_SDF_EDGE_SEEDS", "0") or 0)
         gx = self.tri_sdf_gx
-        gx.t52_diag = wp.zeros(4, dtype=float, device=device)
+        # [0] edge-visit overflows [1] triangles probed [2] seeds accepted [3] vertex-visit overflows
+        # [4] Lipschitz pre-filter skipped [5] pre-filter passed (expensive seeds run)
+        gx.t52_diag = wp.zeros(6, dtype=float, device=device)
         nslot = max(len(verts_list), 1)
         if int(_T52_EDGE_SEEDS_BAKED) != (1 if mode != 0 else 0):
             raise RuntimeError(

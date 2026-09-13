@@ -3037,11 +3037,18 @@ def project_tri_sdf_kernel(
         w = wp.vec3(0.0, 0.0, 1.0)
     if _T52_EDGE_SEEDS != 0:
         # T52: same edge-crossing seed as tri_sdf_closest_mesh, on this kernel's field
-        n_s52, d_s52, w_s52 = t52_seeds_voxel(a, b, c, gx, slot, sdf, base, nx, ny, nz, org, inv_voxel, bg)
-        if n_s52 > 0:
-            if d_s52 < best:
-                best = d_s52
-                w = w_s52
+        # same Lipschitz pre-filter; one voxel of slack for the trilinear field
+        reach52 = wp.max(wp.length(a - p), wp.max(wp.length(b - p), wp.length(c - p)))
+        l_a52 = wp.max(wp.length(b - a), wp.length(c - a))
+        l_b52 = wp.max(wp.length(b - a), wp.length(c - b))
+        l_c52 = wp.max(wp.length(c - a), wp.length(c - b))
+        lbound52 = wp.max(dg - reach52, wp.max(da - l_a52, wp.max(db - l_b52, dc - l_c52)))
+        if lbound52 <= half_thickness + voxel:
+            n_s52, d_s52, w_s52 = t52_seeds_voxel(a, b, c, gx, slot, sdf, base, nx, ny, nz, org, inv_voxel, bg)
+            if n_s52 > 0:
+                if d_s52 < best:
+                    best = d_s52
+                    w = w_s52
     if best >= bg:
         return
 
@@ -3567,16 +3574,29 @@ def tri_sdf_closest_mesh(
         # mean of those crossings sits inside the small SDF<0 island the four
         # seeds above cannot reach.  Strictly-deeper acceptance, then the same
         # refinement.
-        n_s52, d_s52, w_s52, nn_s52 = t52_seeds_exact(a, b, c, mesh, gx, slot, rq, bg)
-        if n_s52 > 0:
-            wp.atomic_add(gx.t52_diag, 1, 1.0)
-            if d_s52 < best - tol:
-                wp.atomic_add(gx.t52_diag, 2, 1.0)
-                best = d_s52
-                w = w_s52
-                nbest = nn_s52
-                if _T14_SDF_SKIPREF != 0:
-                    p_best = a * w_s52[0] + b * w_s52[1] + c * w_s52[2]
+        # Strict 1-Lipschitz pre-filter (loses no solution): every point x of the
+        # triangle is within ``reach`` of the centroid and within the longest
+        # incident edge of each vertex, so min_tri SDF >= max(SDF(g) - reach,
+        # SDF(v) - l_v).  If that bound already exceeds the shell h the triangle
+        # cannot touch or penetrate and the expensive seeds are skipped.
+        l_a52 = wp.max(wp.length(b - a), wp.length(c - a))
+        l_b52 = wp.max(wp.length(b - a), wp.length(c - b))
+        l_c52 = wp.max(wp.length(c - a), wp.length(c - b))
+        lbound52 = wp.max(dg - reach, wp.max(da - l_a52, wp.max(db - l_b52, dc - l_c52)))
+        if lbound52 > cull:
+            wp.atomic_add(gx.t52_diag, 4, 1.0)
+        else:
+            wp.atomic_add(gx.t52_diag, 5, 1.0)
+            n_s52, d_s52, w_s52, nn_s52 = t52_seeds_exact(a, b, c, mesh, gx, slot, rq, bg)
+            if n_s52 > 0:
+                wp.atomic_add(gx.t52_diag, 1, 1.0)
+                if d_s52 < best - tol:
+                    wp.atomic_add(gx.t52_diag, 2, 1.0)
+                    best = d_s52
+                    w = w_s52
+                    nbest = nn_s52
+                    if _T14_SDF_SKIPREF != 0:
+                        p_best = a * w_s52[0] + b * w_s52[1] + c * w_s52[2]
     if _T16_SDF_ARGMIN_SOFT != 0.0:
         # softmin over the four seeds -> a CONTINUOUS starting point, then the
         # same descent from there.  One extra field evaluation (at the blend).
