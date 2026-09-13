@@ -361,6 +361,22 @@ _T52_VISIT_CAP = wp.constant(65536)
 # 每三角最多对多少个棱交点做「沿棱伪法向往刀内侧偏移」的场评估（每个交点 2 个偏移量）。
 # 门 1 v1：只用交点平均时，交点少或孤岛被三角边界截断，平均点落在刀面上（d≈0）判未穿。
 _T52_EVAL_CAP = wp.constant(16)
+# T59（默认 0 = OFF，codegen 级逐位：常量为 0 时下面每个 `if _T59_SEED_PASS != 0` 都被折叠掉）：
+# F2 种子「拆 pass」。原 v4 在迭代 0 的力核线程里串行做 BVH 遍历 + 最多 ~55 次精确 sdf_query，
+# 核墙钟被最慢线程拖住。ON 时在迭代 0 的力核之前另发三次 launch：
+#   K1 t59_seed_gather_kernel（每 (slot,tri) 一线程）：与 tri_sdf_closest_mesh 同式的质心剔除，
+#      通过的对按原顺序枚举全部探针点（不查场）写进定容缓冲；探针数 > K 或候选数 > 容量的对，
+#      就地用原 t52_seeds_exact 串行算完（同一函数，同一输入）；
+#   K2 t59_probe_eval_kernel（每 (候选, 探针) 一线程）：逐探针 sdf_query，输入与串行版逐位相同；
+#   K3 t59_seed_reduce_kernel（每候选一线程）：按枚举顺序、严格 < 归约出 (found, best, w, n)，
+#      与串行版的比较序列完全相同。
+# 力核迭代 0 只读每对的归约结果，不再内联 t52_seeds_exact（也消掉迭代 1..19 的代码膨胀）。
+# 仅 _T52_EDGE_SEEDS 开时生效；T14 HOLD_DIAG（seed_mode 0）与之不组合（读不到结果时按「无种子」，计数 t59_diag[2]）。
+_T59_SEED_PASS = wp.constant(
+    1 if (_T52_ON and int(__import__("os").environ.get("T59_SEED_PASS", "0") or 0) != 0) else 0
+)
+# 每个候选对最多存多少个探针（c 类最多 16×3 + 1 个均值点，d 类每顶点 2 个；超出的对走 K1 串行）
+_T59_SEED_K = wp.constant(int(__import__("os").environ.get("T59_SEED_K", "64") or 64))
 # 门 1 v3：种子类别改为运行时位掩码 gx.t52_mask（不重编译即可逐类消融）：
 #   1 = (b) 布三角三条边 × 刀网格（mesh_query_ray 双向取进入点，往里偏 0.05/0.2 mm）
 #   2 = (c) 刀网格棱 × 布三角内部（交点平均 + 每交点两个面内往刀内侧偏移探针）
@@ -549,6 +565,28 @@ class SdfGridExact:
     # v4 per-(slot, tri) seed cache: best seed barycentric w from iteration 0 of the substep
     t52_cw: wp.array(dtype=wp.vec3)
     t52_cvalid: wp.array(dtype=wp.int32)
+    # T59 seed pass (inert unless _T59_SEED_PASS; length-1 dummies otherwise)
+    # per pair: >=0 candidate slot, -1 culled in K1, -2 seeds computed serially in K1
+    t59_pairk: wp.array(dtype=wp.int32)
+    # per candidate slot: pair (-1 = slot abandoned), probe count, query radius
+    t59_kpair: wp.array(dtype=wp.int32)
+    t59_np: wp.array(dtype=wp.int32)
+    t59_rq: wp.array(dtype=float)
+    # per (candidate, probe): point, barycentric w, field value, normal
+    t59_pk: wp.array(dtype=wp.vec3)
+    t59_pw: wp.array(dtype=wp.vec3)
+    t59_pd: wp.array(dtype=float)
+    t59_pn: wp.array(dtype=wp.vec3)
+    # [0] candidates gathered this substep (atomic counter, zeroed before K1)
+    t59_count: wp.array(dtype=wp.int32)
+    t59_cap: int
+    # per pair: reduced seed result (found, best d, w, normal)
+    t59_rn: wp.array(dtype=wp.int32)
+    t59_rd: wp.array(dtype=float)
+    t59_rw: wp.array(dtype=wp.vec3)
+    t59_rnn: wp.array(dtype=wp.vec3)
+    # diagnostics only: [0] gathered [1] computed serially in K1 [2] force kernel found pairk == -1
+    t59_diag: wp.array(dtype=float)
 
 
 @wp.func
@@ -776,6 +814,273 @@ def t52_seeds_exact(
                                 wbest = wk
                                 nbest = nk
     return found, best, wbest, nbest
+
+
+@wp.func
+def t59_store_probe(gx: SdfGridExact, kc: int, n: int, pk: wp.vec3, wk: wp.vec3):
+    """T59: store probe ``n`` of candidate ``kc``; returns n + 1, or -1 once the per-candidate capacity is exceeded."""
+    r = int(-1)
+    if n >= 0:
+        if n < _T59_SEED_K:
+            i = kc * _T59_SEED_K + n
+            gx.t59_pk[i] = pk
+            gx.t59_pw[i] = wk
+            r = n + 1
+    return r
+
+
+@wp.func
+def t59_seed_enum(
+    a: wp.vec3,
+    b: wp.vec3,
+    c: wp.vec3,
+    mesh: wp.uint64,
+    gx: SdfGridExact,
+    slot: int,
+    kc: int,
+):
+    """T59: ``t52_seeds_exact`` with every ``sdf_query`` replaced by storing the probe.
+
+    Statement for statement the same enumeration (same point / barycentric expressions,
+    same order, same inside tests), so the stored sequence is exactly the sequence of
+    points the serial search evaluates and compares.  Returns the probe count, or -1 if
+    the candidate needs more than ``_T59_SEED_K`` slots (the caller then runs the serial
+    search instead)."""
+    n = int(0)
+    e1 = b - a
+    e2 = c - a
+    nt = wp.cross(e1, e2)
+    lnt = wp.length(nt)
+    mask = gx.t52_mask
+    if lnt > 1.0e-20:
+        nn = nt / lnt
+        # ---- (b) triangle edges x mesh
+        if (mask & 1) != 0:
+            for k in range(3):
+                p = a
+                qd = b - a
+                if k == 1:
+                    p = b
+                    qd = c - b
+                if k == 2:
+                    p = c
+                    qd = a - c
+                L = wp.length(qd)
+                if L > 1.0e-12:
+                    dv = qd / L
+                    for side in range(2):
+                        s0 = p
+                        sdv = dv
+                        if side == 1:
+                            s0 = p + qd
+                            sdv = -dv
+                        hq = wp.mesh_query_ray(mesh, s0, sdv, L)
+                        if hq.result:
+                            if wp.dot(sdv, hq.normal) < 0.0:
+                                for j in range(2):
+                                    delta = float(5.0e-5)
+                                    if j == 1:
+                                        delta = 2.0e-4
+                                    sdist = hq.t + delta
+                                    if sdist < L:
+                                        tau = sdist / L
+                                        if side == 1:
+                                            tau = 1.0 - tau
+                                        wk = t52_edge_bary(k, tau)
+                                        pk = a * wk[0] + b * wk[1] + c * wk[2]
+                                        n = t59_store_probe(gx, kc, n, pk, wk)
+        pad = wp.vec3(1.0e-5, 1.0e-5, 1.0e-5)
+        lo = wp.min(wp.min(a, b), c) - pad
+        hi = wp.max(wp.max(a, b), c) + pad
+        # ---- (c) mesh edges x triangle interior
+        if (mask & 2) != 0:
+            ebase = gx.t52_ebase[slot]
+            acc = wp.vec3(0.0)
+            cnt = int(0)
+            nev = int(0)
+            visit = int(0)
+            idx = int(0)
+            q = wp.bvh_query_aabb(gx.t52_bvh[slot], lo, hi)
+            while wp.bvh_query_next(q, idx):
+                visit = visit + 1
+                if visit > _T52_VISIT_CAP:
+                    wp.atomic_add(gx.t52_diag, 0, 1.0)
+                    break
+                p0 = gx.t52_p0[ebase + idx]
+                hit, u, v = t52_cross(p0, gx.t52_p1[ebase + idx] - p0, a, e1, e2)
+                if hit != 0:
+                    acc = acc + wp.vec3(1.0 - u - v, u, v)
+                    cnt = cnt + 1
+                    if nev < _T52_EVAL_CAP:
+                        nev = nev + 1
+                        okd, inw = t52_inward(gx.t52_n[ebase + idx], e1, e2)
+                        if okd != 0:
+                            x = a + e1 * u + e2 * v
+                            for j in range(3):
+                                delta = float(1.0e-5)
+                                if j == 1:
+                                    delta = 5.0e-5
+                                if j == 2:
+                                    delta = 2.0e-4
+                                pk = x + inw * delta
+                                ins, wk = t52_bary_in(pk, a, e1, e2)
+                                if ins != 0:
+                                    n = t59_store_probe(gx, kc, n, pk, wk)
+            if cnt > 0:
+                wa = acc / float(cnt)
+                pa = a * wa[0] + b * wa[1] + c * wa[2]
+                n = t59_store_probe(gx, kc, n, pa, wa)
+        # ---- (d) convex sharp vertices -> triangle plane
+        if (mask & 4) != 0:
+            padv = wp.vec3(1.0e-3, 1.0e-3, 1.0e-3)
+            vbase = gx.t52_vbase[slot]
+            vvisit = int(0)
+            vi = int(0)
+            vq = wp.bvh_query_aabb(gx.t52_vbvh[slot], lo - padv, hi + padv)
+            while wp.bvh_query_next(vq, vi):
+                vvisit = vvisit + 1
+                if vvisit > _T52_VISIT_CAP:
+                    wp.atomic_add(gx.t52_diag, 3, 1.0)
+                    break
+                vp = gx.t52_vp[vbase + vi]
+                hgt = wp.dot(vp - a, nn)
+                for j in range(2):
+                    pk = vp - nn * hgt
+                    okj = int(1)
+                    if j == 1:
+                        okj = 0
+                        vnrm = gx.t52_vn[vbase + vi]
+                        den = wp.dot(vnrm, nn)
+                        if wp.abs(den) > 0.2:
+                            pk = vp - vnrm * (hgt / den)
+                            okj = 1
+                    if okj != 0:
+                        ins, wk = t52_bary_in(pk, a, e1, e2)
+                        if ins != 0:
+                            n = t59_store_probe(gx, kc, n, pk, wk)
+    return n
+
+
+@wp.kernel
+def t59_seed_gather_kernel(
+    pos: wp.array(dtype=wp.vec3),
+    tri_indices: wp.array2d(dtype=wp.int32),
+    tri_count: int,
+    slot_shape: wp.array(dtype=int),
+    shape_body: wp.array(dtype=int),
+    shape_transform: wp.array(dtype=wp.transform),
+    body_q: wp.array(dtype=wp.transform),
+    sdf_mesh: wp.array(dtype=wp.uint64),
+    gx: SdfGridExact,
+    bg: float,
+    half_thickness: float,
+):
+    """T59 K1: per (slot, tri) pair, the force kernel's local triangle and the
+    ``tri_sdf_closest_mesh`` centroid rejection, then enumerate the seed probes."""
+    pair = wp.tid()
+    slot = pair / tri_count
+    t = pair - slot * tri_count
+
+    shape = slot_shape[slot]
+    body = shape_body[shape]
+    X_ws = shape_transform[shape]
+    if body >= 0:
+        X_ws = body_q[body] * shape_transform[shape]
+    X_sw = wp.transform_inverse(X_ws)
+
+    i0 = tri_indices[t, 0]
+    i1 = tri_indices[t, 1]
+    i2 = tri_indices[t, 2]
+    a = wp.transform_point(X_sw, pos[i0])
+    b = wp.transform_point(X_sw, pos[i1])
+    c = wp.transform_point(X_sw, pos[i2])
+
+    mesh = sdf_mesh[slot]
+    cull = half_thickness
+    # --- verbatim from tri_sdf_closest_mesh
+    third = 1.0 / 3.0
+    g = (a + b + c) * third
+    reach = wp.max(wp.length(a - g), wp.max(wp.length(b - g), wp.length(c - g)))
+    rq = cull + 2.0 * reach
+    best, nbest = sdf_query(mesh, gx, slot, cull + reach, bg, g)
+    if best >= bg:
+        gx.t59_pairk[pair] = -1
+        return
+    if _T14_SDF_RQ != 0:
+        rq = wp.abs(best) + reach + 1.0e-6
+    # ---
+    kc = wp.atomic_add(gx.t59_count, 0, 1)
+    if kc < gx.t59_cap:
+        wp.atomic_add(gx.t59_diag, 0, 1.0)
+        n = t59_seed_enum(a, b, c, mesh, gx, slot, kc)
+        if n >= 0:
+            gx.t59_kpair[kc] = pair
+            gx.t59_rq[kc] = rq
+            gx.t59_np[kc] = n
+            gx.t59_pairk[pair] = kc
+            return
+        gx.t59_kpair[kc] = -1
+        gx.t59_np[kc] = 0
+    # capacity or per-candidate probe overflow: the serial search, same function, same inputs
+    n_s, d_s, w_s, nn_s = t52_seeds_exact(a, b, c, mesh, gx, slot, rq, bg)
+    gx.t59_rn[pair] = n_s
+    gx.t59_rd[pair] = d_s
+    gx.t59_rw[pair] = w_s
+    gx.t59_rnn[pair] = nn_s
+    gx.t59_pairk[pair] = -2
+    wp.atomic_add(gx.t59_diag, 1, 1.0)
+
+
+@wp.kernel
+def t59_probe_eval_kernel(
+    tri_count: int,
+    sdf_mesh: wp.array(dtype=wp.uint64),
+    gx: SdfGridExact,
+    bg: float,
+):
+    """T59 K2: one thread per (candidate, probe) slot; the serial search's ``sdf_query`` on the stored point."""
+    tid = wp.tid()
+    kc = tid / _T59_SEED_K
+    j = tid - kc * _T59_SEED_K
+    if kc >= wp.min(gx.t59_count[0], gx.t59_cap):
+        return
+    if j >= gx.t59_np[kc]:
+        return
+    pair = gx.t59_kpair[kc]
+    slot = pair / tri_count
+    dk, nk = sdf_query(sdf_mesh[slot], gx, slot, gx.t59_rq[kc], bg, gx.t59_pk[tid])
+    gx.t59_pd[tid] = dk
+    gx.t59_pn[tid] = nk
+
+
+@wp.kernel
+def t59_seed_reduce_kernel(
+    gx: SdfGridExact,
+    bg: float,
+):
+    """T59 K3: one thread per candidate; the serial search's comparison sequence
+    (initial ``bg`` / zero w / +z normal, strict ``<``, enumeration order)."""
+    kc = wp.tid()
+    if kc >= wp.min(gx.t59_count[0], gx.t59_cap):
+        return
+    pair = gx.t59_kpair[kc]
+    if pair < 0:
+        return
+    n = gx.t59_np[kc]
+    best = bg
+    wbest = wp.vec3(0.0)
+    nbest = wp.vec3(0.0, 0.0, 1.0)
+    base = kc * _T59_SEED_K
+    for j in range(n):
+        dk = gx.t59_pd[base + j]
+        if dk < best:
+            best = dk
+            wbest = gx.t59_pw[base + j]
+            nbest = gx.t59_pn[base + j]
+    gx.t59_rn[pair] = n
+    gx.t59_rd[pair] = best
+    gx.t59_rw[pair] = wbest
+    gx.t59_rnn[pair] = nbest
 
 
 @wp.func
@@ -3594,22 +3899,54 @@ def tri_sdf_closest_mesh(
                     if _T14_SDF_SKIPREF != 0:
                         p_best = p_c52
         else:
-            n_s52, d_s52, w_s52, nn_s52 = t52_seeds_exact(a, b, c, mesh, gx, slot, rq, bg)
-            if seed_mode == 1:
-                if n_s52 > 0:
-                    gx.t52_cw[pair] = w_s52
-                    gx.t52_cvalid[pair] = 1
+            if _T59_SEED_PASS != 0:
+                # T59: the seed pass (K1-K3) already ran for this substep; read its result.
+                n_t59 = int(0)
+                d_t59 = float(bg)
+                w_t59 = wp.vec3(0.0)
+                nn_t59 = wp.vec3(0.0, 0.0, 1.0)
+                k_t59 = int(-1)
+                if seed_mode == 1:
+                    k_t59 = gx.t59_pairk[pair]
+                if k_t59 != -1:
+                    n_t59 = gx.t59_rn[pair]
+                    d_t59 = gx.t59_rd[pair]
+                    w_t59 = gx.t59_rw[pair]
+                    nn_t59 = gx.t59_rnn[pair]
                 else:
-                    gx.t52_cvalid[pair] = 0
-            if n_s52 > 0:
-                wp.atomic_add(gx.t52_diag, 1, 1.0)
-                if d_s52 < best - tol:
-                    wp.atomic_add(gx.t52_diag, 2, 1.0)
-                    best = d_s52
-                    w = w_s52
-                    nbest = nn_s52
-                    if _T14_SDF_SKIPREF != 0:
-                        p_best = a * w_s52[0] + b * w_s52[1] + c * w_s52[2]
+                    wp.atomic_add(gx.t59_diag, 2, 1.0)
+                if seed_mode == 1:
+                    if n_t59 > 0:
+                        gx.t52_cw[pair] = w_t59
+                        gx.t52_cvalid[pair] = 1
+                    else:
+                        gx.t52_cvalid[pair] = 0
+                if n_t59 > 0:
+                    wp.atomic_add(gx.t52_diag, 1, 1.0)
+                    if d_t59 < best - tol:
+                        wp.atomic_add(gx.t52_diag, 2, 1.0)
+                        best = d_t59
+                        w = w_t59
+                        nbest = nn_t59
+                        if _T14_SDF_SKIPREF != 0:
+                            p_best = a * w_t59[0] + b * w_t59[1] + c * w_t59[2]
+            else:
+                n_s52, d_s52, w_s52, nn_s52 = t52_seeds_exact(a, b, c, mesh, gx, slot, rq, bg)
+                if seed_mode == 1:
+                    if n_s52 > 0:
+                        gx.t52_cw[pair] = w_s52
+                        gx.t52_cvalid[pair] = 1
+                    else:
+                        gx.t52_cvalid[pair] = 0
+                if n_s52 > 0:
+                    wp.atomic_add(gx.t52_diag, 1, 1.0)
+                    if d_s52 < best - tol:
+                        wp.atomic_add(gx.t52_diag, 2, 1.0)
+                        best = d_s52
+                        w = w_s52
+                        nbest = nn_s52
+                        if _T14_SDF_SKIPREF != 0:
+                            p_best = a * w_s52[0] + b * w_s52[1] + c * w_s52[2]
     if _T16_SDF_ARGMIN_SOFT != 0.0:
         # softmin over the four seeds -> a CONTINUOUS starting point, then the
         # same descent from there.  One extra field evaluation (at the blend).

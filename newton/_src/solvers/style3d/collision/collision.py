@@ -40,12 +40,17 @@ from newton._src.solvers.style3d.collision.kernels import (
     tri_sdf_par_cull_kernel,
     tri_sdf_par_seed_kernel,
     SdfGridExact,
+    t59_seed_gather_kernel,
+    t59_probe_eval_kernel,
+    t59_seed_reduce_kernel,
 )
 # T18 自证串用：读**内核里真正烘进 wp.constant 的那个值**，不是再读一次 os.environ
 # （环境在 import newton 之后改掉的话两者会不一致，自证串必须报前者）。
 from newton._src.solvers.style3d.collision.kernels import (  # noqa: E402
     _T18_FIX_RAW as _T18_FIX_RAW_BAKED,
     _T52_EDGE_SEEDS as _T52_EDGE_SEEDS_BAKED,
+    _T59_SEED_PASS as _T59_SEED_PASS_BAKED,
+    _T59_SEED_K as _T59_SEED_K_BAKED,
 )
 from newton._src.solvers.style3d.collision import kernels as _t52_kernels_module  # noqa: E402
 from newton._src.solvers.style3d.collision import _t14_prof
@@ -1456,6 +1461,12 @@ class Collision:
                     # built here is valid for every consumer of this substep --
                     # including the reaction pass, which runs after the solve.
                     self._t14_broadphase(state_out.particle_q, _tri_sdf_body_q, _n_pairs)
+                if _iter == 0 and _hold_mode != 2 and getattr(self, "t59_seed_pass", False):
+                    # T59: seed pass for this substep, on exactly the force kernel's inputs.
+                    _t59_q = state_out.particle_q
+                    if self.tri_sdf_force_pre_q and self.tri_sdf_pre_q is not None:
+                        _t59_q = self.tri_sdf_pre_q
+                    self._t59_seed_pass(_t59_q, _tri_sdf_body_q, _n_pairs)
                 for _bp_dim, _bp_mode in self._t14_launch_plan(_n_pairs):
                     with _t14_prof.section("tri_sdf_force"
                                           if _hold_mode != 2
@@ -1778,6 +1789,35 @@ class Collision:
         _np52 = max(int(n_pairs), 1) if mode != 0 else 1
         gx.t52_cw = wp.zeros(_np52, dtype=wp.vec3, device=device)
         gx.t52_cvalid = wp.zeros(_np52, dtype=wp.int32, device=device)
+        # T59 seed pass buffers (length-1 dummies unless the pass is baked on)
+        _t59_on = int(_T59_SEED_PASS_BAKED) != 0 and mode != 0 and bool(verts_list)
+        _t59_req = int(os.environ.get("T59_SEED_PASS", "0") or 0)
+        _k59 = int(_T59_SEED_K_BAKED)
+        _cap59 = max(1, int(os.environ.get("T59_SEED_CAP", "4096") or 4096)) if _t59_on else 1
+        _np59 = _np52 if _t59_on else 1
+        gx.t59_pairk = wp.full(_np59, -1, dtype=wp.int32, device=device)
+        gx.t59_kpair = wp.full(_cap59, -1, dtype=wp.int32, device=device)
+        gx.t59_np = wp.zeros(_cap59, dtype=wp.int32, device=device)
+        gx.t59_rq = wp.zeros(_cap59, dtype=float, device=device)
+        gx.t59_pk = wp.zeros(_cap59 * _k59 if _t59_on else 1, dtype=wp.vec3, device=device)
+        gx.t59_pw = wp.zeros(_cap59 * _k59 if _t59_on else 1, dtype=wp.vec3, device=device)
+        gx.t59_pd = wp.zeros(_cap59 * _k59 if _t59_on else 1, dtype=float, device=device)
+        gx.t59_pn = wp.zeros(_cap59 * _k59 if _t59_on else 1, dtype=wp.vec3, device=device)
+        gx.t59_count = wp.zeros(1, dtype=wp.int32, device=device)
+        gx.t59_cap = int(_cap59)
+        gx.t59_rn = wp.zeros(_np59, dtype=wp.int32, device=device)
+        gx.t59_rd = wp.zeros(_np59, dtype=float, device=device)
+        gx.t59_rw = wp.zeros(_np59, dtype=wp.vec3, device=device)
+        gx.t59_rnn = wp.zeros(_np59, dtype=wp.vec3, device=device)
+        gx.t59_diag = wp.zeros(3, dtype=float, device=device)
+        self.t59_seed_pass = bool(_t59_on)
+        if _t59_req != 0 and not _t59_on:
+            print(f"[T59] seed_pass requested={_t59_req} but INACTIVE (baked={int(_T59_SEED_PASS_BAKED)} t52_mode={mode})", flush=True)
+        print(
+            f"[T59] seed_pass={int(_t59_on)} baked={int(_T59_SEED_PASS_BAKED)} cap={_cap59} K={_k59} "
+            f"pairs={_np59} (iter0: K1 gather n_pairs, K2 probe eval cap*K, K3 reduce cap; force kernel reads per-pair result)",
+            flush=True,
+        )
         if mode == 0 or not verts_list:
             gx.t52_p0 = wp.zeros(1, dtype=wp.vec3, device=device)
             gx.t52_p1 = wp.zeros(1, dtype=wp.vec3, device=device)
@@ -1902,6 +1942,57 @@ class Collision:
             f"kernels_enable_backward={bool(wp.get_module_options(_t52_kernels_module).get('enable_backward', True))}",
             flush=True,
         )
+
+    def _t59_seed_pass(self, particle_q, body_q, n_pairs: int):
+        """T59: gather / evaluate / reduce the F2 seeds before iteration 0's force kernel.
+
+        Fixed launch dims (n_pairs, cap*K, cap) and a device-side counter, so the
+        substep stays CUDA-graph capturable."""
+        gx = self.tri_sdf_gx
+        gx.t59_count.zero_()
+        with _t14_prof.section("t59_seed_gather"):
+            wp.launch(
+                t59_seed_gather_kernel,
+                dim=n_pairs,
+                inputs=[
+                    particle_q,
+                    self.model.tri_indices,
+                    int(self.model.tri_count),
+                    self.tri_sdf_slot_shape,
+                    self.model.shape_body,
+                    self.model.shape_transform,
+                    body_q,
+                    self.tri_sdf_mesh_id,
+                    gx,
+                    self.tri_sdf_bg,
+                    self.tri_sdf_h,
+                ],
+                device=self.model.device,
+            )
+        with _t14_prof.section("t59_probe_eval"):
+            wp.launch(
+                t59_probe_eval_kernel,
+                dim=int(gx.t59_cap) * int(_T59_SEED_K_BAKED),
+                inputs=[int(self.model.tri_count), self.tri_sdf_mesh_id, gx, self.tri_sdf_bg],
+                device=self.model.device,
+            )
+        with _t14_prof.section("t59_seed_reduce"):
+            wp.launch(
+                t59_seed_reduce_kernel,
+                dim=int(gx.t59_cap),
+                inputs=[gx, self.tri_sdf_bg],
+                device=self.model.device,
+            )
+
+    def read_t59_diag(self, reset: bool = False):
+        """T59 diagnostic: [gathered, computed serially in K1, force kernel found pairk == -1]."""
+        gx = getattr(self, "tri_sdf_gx", None)
+        if gx is None or getattr(gx, "t59_diag", None) is None:
+            return None
+        v = gx.t59_diag.numpy().copy()
+        if reset:
+            gx.t59_diag.zero_()
+        return v
 
     def read_t52_diag(self, reset: bool = False):
         """T52 diagnostic: [edge-visit overflows, triangles probed, seeds accepted, vertex-visit overflows]."""
