@@ -3936,7 +3936,19 @@ def tri_sdf_closest_mesh(
                 k_t59 = int(-1)
                 if seed_mode == 1:
                     k_t59 = gx.t59_pairk[pair]
-                if k_t59 != -1:
+                if k_t59 >= 0:
+                    # T59 v2: K3 folded in -- the serial search's comparison sequence over the
+                    # probes K2 evaluated (same initial bg / zero w / +z normal, strict '<', enumeration order).
+                    n_t59 = gx.t59_np[k_t59]
+                    base_t59 = k_t59 * _T59_SEED_K
+                    for j_t59 in range(n_t59):
+                        dk_t59 = gx.t59_pd[base_t59 + j_t59]
+                        if dk_t59 < d_t59:
+                            d_t59 = dk_t59
+                            w_t59 = gx.t59_pw[base_t59 + j_t59]
+                            nn_t59 = gx.t59_pn[base_t59 + j_t59]
+                elif k_t59 == -2:
+                    # computed serially in K1 (capacity / probe overflow)
                     n_t59 = gx.t59_rn[pair]
                     d_t59 = gx.t59_rd[pair]
                     w_t59 = gx.t59_rw[pair]

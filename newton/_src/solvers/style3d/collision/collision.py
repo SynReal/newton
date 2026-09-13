@@ -1977,13 +1977,8 @@ class Collision:
                 inputs=[int(self.model.tri_count), self.tri_sdf_mesh_id, gx, self.tri_sdf_bg],
                 device=self.model.device,
             )
-        with _t14_prof.section("t59_seed_reduce"):
-            wp.launch(
-                t59_seed_reduce_kernel,
-                dim=int(gx.t59_cap),
-                inputs=[gx, self.tri_sdf_bg],
-                device=self.model.device,
-            )
+        # T59 v2: no separate reduce launch -- iteration 0's force kernel reduces the
+        # probes in place (t59_seed_reduce_kernel is kept only as the v1 reference).
 
     def read_t59_diag(self, reset: bool = False):
         """T59 diagnostic: [gathered, computed serially in K1, force kernel found pairk == -1]."""
