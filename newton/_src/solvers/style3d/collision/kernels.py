@@ -384,7 +384,7 @@ _T59_SEED_K = wp.constant(int(__import__("os").environ.get("T59_SEED_K", "64") o
 #   [7] 力核 best<h 且 w=0  [8] 投影核接受 w=0 缓存点  [9] 力核 w=0 时 depth 累加（m）
 _T59_ZW_DIAG = wp.constant(int(__import__("os").environ.get("T59_ZW_DIAG", "0") or 0))
 #   诊断续:[10] 力核迭代>=1 搜索后 w=0  [11] 力核迭代 0 搜索后 w=0  [12] 反作用核搜索后 w=0
-#   [13] mode-2 接受 w=0 时 d 之和  [14] 其 max d  [15] 其 max(-d)
+#   [13] mode-2 接受 w=0 时 d 之和  [14] 其中 d<0 的次数  [15] 其中 d<-1e-6 的次数(诊断全部只用 atomic_add)
 #   [16] w=0 时布上法向力散射模长之和(按 w>0 实际施加的那几项)  [17] w=0 时锚切向力散射模长之和
 #   [18] 反作用核 w=0 且 best<h 时 |reaction| 之和(N)  [19] 其 |torque| 之和(N·m)
 #   [20] w=0 时 T8 锚写入(播种/返回映射)  [21] w=0 时 anchor_dbg2 行写入(T22 c_dat)  [22] w=0 时 tail 行写入
@@ -3917,8 +3917,10 @@ def tri_sdf_closest_mesh(
                             if d_c52 < cull:
                                 wp.atomic_add(gx.t59_diag, 4, 1.0)
                             wp.atomic_add(gx.t59_diag, 13, d_c52)
-                            wp.atomic_max(gx.t59_diag, 14, d_c52)
-                            wp.atomic_max(gx.t59_diag, 15, -d_c52)
+                            if d_c52 < 0.0:
+                                wp.atomic_add(gx.t59_diag, 14, 1.0)
+                            if d_c52 < -1.0e-6:
+                                wp.atomic_add(gx.t59_diag, 15, 1.0)
                     best = d_c52
                     w = w_c52
                     nbest = n_c52
