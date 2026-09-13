@@ -47,6 +47,10 @@ from newton._src.solvers.style3d.collision.kernels import (  # noqa: E402
     _T18_FIX_RAW as _T18_FIX_RAW_BAKED,
 )
 from newton._src.solvers.style3d.collision import _t14_prof
+from newton._src.solvers.style3d.collision.t44b_kernels import (  # noqa: E402
+    t44b_accumulate_sweep_displacement_kernel,
+    t44b_remove_projection_velocity_kernel,
+)
 
 
 def _t14_bake_dir():
@@ -398,6 +402,9 @@ class Collision:
         # T42-B: 力核（eval_tri_sdf_contact_kernel）的压深也读投影前快照，与
         # accumulate_tri_sdf_reaction 同一口径。默认关。
         self.tri_sdf_force_pre_q = False
+        # T44b（默认关）：三角形级投影的位移不进粒子速度。只在 tri_sdf_projection 开时生效。
+        self.tri_sdf_proj_nokick = False
+        self.t44b_step_disp = None
         self.tri_sdf_compliant = False
         # R16-A2': the shape meshes the exact query backend evaluates against.
         self.tri_sdf_meshes = None
@@ -2616,6 +2623,14 @@ class Collision:
         if self.tri_sdf_projection:
             # 初值 = 当前位置，不是 0：力核可能在第一次 sweep 之前就读它。
             self.tri_sdf_pre_q = wp.clone(self.model.particle_q)
+        # T44b（默认关）：投影位移不进速度。环境变量不设 / 设 0 ⇒ 保持 False ⇒
+        # _tri_sdf_sweep 与 frame_end 里的新分支都不进、不分配 ⇒ 与 d5e550ec 逐位相同。
+        _t44b_req = bool(int(_os.environ.get("T44B_TRI_PROJ_NOKICK", "0")))
+        self.tri_sdf_proj_nokick = _t44b_req and self.tri_sdf_projection
+        if self.tri_sdf_proj_nokick:
+            self.t44b_step_disp = wp.zeros(
+                self.model.particle_count, dtype=wp.vec3, device=self.model.device
+            )
         _t42_deep = float(_os.environ.get("T42_TRI_DEEP_ONLY_MM", "0"))
         print(
             f"[T42] tri_deep_only_mm={_t42_deep:g} force_pre_q={int(self.tri_sdf_force_pre_q)}"
@@ -2628,6 +2643,13 @@ class Collision:
             f"(compliant={int(bool(self.tri_sdf_compliant))}, "
             f"h={half_thickness * 1000:g} mm, max_corr={max_correction * 1000:g} mm, "
             f"reaction reads {'PRE-projection snapshot' if self.tri_sdf_projection else 'particle_q as given'})",
+            flush=True,
+        )
+        print(
+            f"[T44b] tri_proj_nokick={int(self.tri_sdf_proj_nokick)} (requested={int(_t44b_req)}"
+            + (", IGNORED: tri_sdf_projection is off" if _t44b_req and not self.tri_sdf_projection else "")
+            + (", projection displacement removed from particle_qd at frame_end" if self.tri_sdf_proj_nokick else "")
+            + ")",
             flush=True,
         )
 
@@ -2672,6 +2694,15 @@ class Collision:
             outputs=[self.proj_delta, self.proj_weight, particle_q, self.proj_accum],
             device=self.model.device,
         )
+        if self.tri_sdf_proj_nokick:
+            # T44b：本次 sweep 实际搬动的位移 = 搬后 − sweep 开头的快照（上面 assign 过）。
+            wp.launch(
+                t44b_accumulate_sweep_displacement_kernel,
+                dim=self.model.particle_count,
+                inputs=[self.tri_sdf_pre_q, particle_q],
+                outputs=[self.t44b_step_disp],
+                device=self.model.device,
+            )
 
     def set_projection_shapes(self, shape_indices) -> None:
         """Restrict the position projection to the given shapes.
@@ -3004,3 +3035,12 @@ class Collision:
 
     def frame_end(self, pos: wp.array[wp.vec3], vel: wp.array[wp.vec3], dt: float):
         """Apply post-processing"""
+        if self.tri_sdf_proj_nokick and self.t44b_step_disp is not None:
+            # T44b：update_velocity 刚算完 vel = 0.998*(x - x_prev)/dt，其中含本步所有
+            # 三角形投影 sweep 的位移；按同一系数扣掉并清零累加器 ⇒ 投影只改位置。
+            wp.launch(
+                t44b_remove_projection_velocity_kernel,
+                dim=self.model.particle_count,
+                inputs=[0.998 / dt, self.t44b_step_disp, vel],
+                device=self.model.device,
+            )
