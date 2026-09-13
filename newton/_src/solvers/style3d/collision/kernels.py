@@ -337,6 +337,23 @@ _T16_SDF_ARGMIN_TOL = wp.constant(float(__import__("os").environ.get("T16_SDF_AR
 # d_deep 单位 mm，本批取 0.5 mm（= 壳厚 h），即「真穿过刀面 0.5 mm 以上才动」。
 _T42_TRI_DEEP_ONLY = wp.constant(float(__import__("os").environ.get("T42_TRI_DEEP_ONLY_MM", "0")) * 1.0e-3)
 
+# T52（默认 0 = OFF，codegen 级逐位：常量为 0 时下面每个 `if _T52_EDGE_SEEDS != 0`
+# 都被折叠掉）：tri-SDF 最近点搜索加「刚体网格棱穿三角」种子。
+#
+# T51 实测：刀的凸锐角/棱从布三角**内部**穿出、三角三个顶点都在刀外时，三角面上
+# SDF < 0 的区域是一个中位只占三角面积 1.4 %、直径 1.45 mm 的孤岛，紧贴锐棱；
+# 质心 + 3 顶点种子 + 3 步固定步长下降（7 次采样）够不到它，101 片真穿三角里
+# 79 片被判「未穿」。刀是闭合网格：它从三角内部穿出而三角顶点都在外面，必有网格棱
+# 穿过该三角（截面多边形的顶点就是穿过三角平面的棱）。所以对每个三角查一次静态
+# 棱 BVH（shape 局部系，刚体不变形 ⇒ 永不 refit ⇒ CUDA graph 安全），线段-三角求交，
+# 交点重心坐标取平均作为额外种子，严格变深才接受，之后照旧 refine。力律/锚/反作用不动。
+# 环境变量取值 1 = 凸锐棱、2 = 全部棱：只影响烘焙的棱表，编译产物相同（常量只取开/关）。
+_T52_EDGE_SEEDS = wp.constant(
+    1 if int(__import__("os").environ.get("T52_TRI_SDF_EDGE_SEEDS", "0") or 0) != 0 else 0
+)
+# 每三角最多访问的候选棱数（固定上限，溢出计数进 gx.t52_diag[0]）。
+_T52_VISIT_CAP = wp.constant(256)
+
 # T16 SOFT: make the choice of contact point CONTINUOUS instead of a switch.
 #
 # ``_T16_SDF_ARGMIN_TOL`` removed the coin flip but replaced it with a THRESHOLD:
@@ -496,6 +513,66 @@ class SdfGridExact:
     ring_idx: wp.array(dtype=wp.int32)
     robase: wp.array(dtype=wp.int32)
     ribase: wp.array(dtype=wp.int32)
+    # T52 (inert unless _T52_EDGE_SEEDS): rigid-mesh edges in shape local, one
+    # block per DISTINCT mesh (``t52_ebase`` per slot), and a static BVH over the
+    # edge bounds per slot.  ``t52_diag`` is a pure diagnostic accumulator:
+    # [0] visit-cap overflows [1] seeds found [2] seeds accepted.
+    t52_p0: wp.array(dtype=wp.vec3)
+    t52_p1: wp.array(dtype=wp.vec3)
+    t52_ebase: wp.array(dtype=wp.int32)
+    t52_bvh: wp.array(dtype=wp.uint64)
+    t52_diag: wp.array(dtype=float)
+
+
+@wp.func
+def t52_edge_seed(
+    a: wp.vec3,
+    b: wp.vec3,
+    c: wp.vec3,
+    gx: SdfGridExact,
+    slot: int,
+):
+    """T52: average barycentric point where the shape's edges cross triangle (a, b, c).
+
+    All inputs in the shape's local frame.  Returns (count, w); count == 0 means
+    no edge crosses the triangle and ``w`` must not be used.
+    """
+    pad = wp.vec3(1.0e-5, 1.0e-5, 1.0e-5)
+    lo = wp.min(wp.min(a, b), c) - pad
+    hi = wp.max(wp.max(a, b), c) + pad
+    base = gx.t52_ebase[slot]
+    e1 = b - a
+    e2 = c - a
+    acc = wp.vec3(0.0)
+    cnt = int(0)
+    visit = int(0)
+    idx = int(0)
+    q = wp.bvh_query_aabb(gx.t52_bvh[slot], lo, hi)
+    while wp.bvh_query_next(q, idx):
+        visit = visit + 1
+        if visit > _T52_VISIT_CAP:
+            wp.atomic_add(gx.t52_diag, 0, 1.0)
+            break
+        p0 = gx.t52_p0[base + idx]
+        d = gx.t52_p1[base + idx] - p0
+        hv = wp.cross(d, e2)
+        det = wp.dot(e1, hv)
+        if wp.abs(det) > 1.0e-30:
+            inv = 1.0 / det
+            s = p0 - a
+            u = inv * wp.dot(s, hv)
+            if u >= 0.0 and u <= 1.0:
+                qv = wp.cross(s, e1)
+                v = inv * wp.dot(d, qv)
+                if v >= 0.0 and u + v <= 1.0:
+                    tt = inv * wp.dot(e2, qv)
+                    if tt >= 0.0 and tt <= 1.0:
+                        acc = acc + wp.vec3(1.0 - u - v, u, v)
+                        cnt = cnt + 1
+    w = wp.vec3(0.0)
+    if cnt > 0:
+        w = acc / float(cnt)
+    return cnt, w
 
 
 @wp.kernel
@@ -2566,6 +2643,8 @@ def project_tri_sdf_kernel(
     half_thickness: float,
     max_correction: float,
     refine_steps: int,
+    # T52: edge-crossing seeds (inert unless _T52_EDGE_SEEDS)
+    gx: SdfGridExact,
     # outputs
     delta: wp.array(dtype=wp.vec3),
     delta_weight: wp.array(dtype=float),
@@ -2618,6 +2697,15 @@ def project_tri_sdf_kernel(
     if dc < best:
         best = dc
         w = wp.vec3(0.0, 0.0, 1.0)
+    if _T52_EDGE_SEEDS != 0:
+        # T52: same edge-crossing seed as tri_sdf_closest_mesh, on this kernel's field
+        n_s52, w_s52 = t52_edge_seed(a, b, c, gx, slot)
+        if n_s52 > 0:
+            p_s52 = a * w_s52[0] + b * w_s52[1] + c * w_s52[2]
+            d_s52 = sdf_grid_sample(sdf, base, nx, ny, nz, org, inv_voxel, bg, p_s52)
+            if d_s52 < best:
+                best = d_s52
+                w = w_s52
     if best >= bg:
         return
 
@@ -3137,6 +3225,24 @@ def tri_sdf_closest_mesh(
         nbest = nc
         if _T14_SDF_SKIPREF != 0:
             p_best = c
+    if _T52_EDGE_SEEDS != 0:
+        # T52: a closed rigid mesh that pierces the triangle's interior while all
+        # three vertices stay outside must have edges crossing the triangle; the
+        # mean of those crossings sits inside the small SDF<0 island the four
+        # seeds above cannot reach.  Strictly-deeper acceptance, then the same
+        # refinement.
+        n_s52, w_s52 = t52_edge_seed(a, b, c, gx, slot)
+        if n_s52 > 0:
+            wp.atomic_add(gx.t52_diag, 1, 1.0)
+            p_s52 = a * w_s52[0] + b * w_s52[1] + c * w_s52[2]
+            d_s52, nn_s52 = sdf_query(mesh, gx, slot, rq, bg, p_s52)
+            if d_s52 < best - tol:
+                wp.atomic_add(gx.t52_diag, 2, 1.0)
+                best = d_s52
+                w = w_s52
+                nbest = nn_s52
+                if _T14_SDF_SKIPREF != 0:
+                    p_best = p_s52
     if _T16_SDF_ARGMIN_SOFT != 0.0:
         # softmin over the four seeds -> a CONTINUOUS starting point, then the
         # same descent from there.  One extra field evaluation (at the blend).
