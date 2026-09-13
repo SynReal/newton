@@ -47,6 +47,7 @@ from newton._src.solvers.style3d.collision.kernels import (  # noqa: E402
     _T18_FIX_RAW as _T18_FIX_RAW_BAKED,
     _T52_EDGE_SEEDS as _T52_EDGE_SEEDS_BAKED,
 )
+from newton._src.solvers.style3d.collision import kernels as _t52_kernels_module  # noqa: E402
 from newton._src.solvers.style3d.collision import _t14_prof
 from newton._src.solvers.style3d.collision.t44b_kernels import (  # noqa: E402
     t44b_accumulate_sweep_displacement_kernel,
@@ -1769,7 +1770,8 @@ class Collision:
             )
         self.t52_mode = mode
         self.t52_bvhs = []
-        mask = mode & 7
+        # bit 32 = strict 1-Lipschitz pre-filter before the expensive seeds (runtime, same build)
+        mask = mode & 39
         all_edges = bool(mode & 8)
         gx.t52_mask = int(mask)
         if mode == 0 or not verts_list:
@@ -1892,7 +1894,8 @@ class Collision:
         print(
             f"[T52] edge_seeds={mode} baked_const={int(_T52_EDGE_SEEDS_BAKED)} mask={mask} cats={cats} "
             f"meshes={len(ecounts)} edges={ecounts} ({'all' if all_edges else 'convex sharp > 30 deg + boundary'}) "
-            f"convex_verts={vcounts} visit_cap={65536} eval_cap=16 (overflow counts in read_t52_diag [0],[3])",
+            f"convex_verts={vcounts} visit_cap={65536} eval_cap=16 (overflow counts in read_t52_diag [0],[3]) "
+            f"kernels_enable_backward={bool(wp.get_module_options(_t52_kernels_module).get('enable_backward', True))}",
             flush=True,
         )
 

@@ -348,9 +348,13 @@ _T42_TRI_DEEP_ONLY = wp.constant(float(__import__("os").environ.get("T42_TRI_DEE
 # 棱 BVH（shape 局部系，刚体不变形 ⇒ 永不 refit ⇒ CUDA graph 安全），线段-三角求交，
 # 交点重心坐标取平均作为额外种子，严格变深才接受，之后照旧 refine。力律/锚/反作用不动。
 # 环境变量取值 1 = 凸锐棱、2 = 全部棱：只影响烘焙的棱表，编译产物相同（常量只取开/关）。
-_T52_EDGE_SEEDS = wp.constant(
-    1 if int(__import__("os").environ.get("T52_TRI_SDF_EDGE_SEEDS", "0") or 0) != 0 else 0
-)
+_T52_ON = 1 if int(__import__("os").environ.get("T52_TRI_SDF_EDGE_SEEDS", "0") or 0) != 0 else 0
+_T52_EDGE_SEEDS = wp.constant(_T52_ON)
+# 开关 ON 时关掉本模块的反向（adjoint）代码生成：种子里的动态循环 / 嵌套分支内联进接触核后，
+# NVRTC 卡在无人使用的 adjoint 上（T36 先例：1h51m 编不完 -> 关后 58 s）。求解器不走可微路径，
+# 前向数值不变。OFF 时不调用，模块选项保持原样 ⇒ OFF 路径逐位不变。
+if _T52_ON:
+    wp.set_module_options({"enable_backward": False})
 # 每三角最多访问的候选棱数（固定上限，溢出计数进 gx.t52_diag[0]）。门 1 v1：全部棱档
 # 刀尖附近三角的候选有 478–543 条，256 会截掉交点 ⇒ 4096。
 _T52_VISIT_CAP = wp.constant(65536)
@@ -3043,7 +3047,7 @@ def project_tri_sdf_kernel(
         l_b52 = wp.max(wp.length(b - a), wp.length(c - b))
         l_c52 = wp.max(wp.length(c - a), wp.length(c - b))
         lbound52 = wp.max(dg - reach52, wp.max(da - l_a52, wp.max(db - l_b52, dc - l_c52)))
-        if lbound52 <= half_thickness + voxel:
+        if lbound52 <= half_thickness + voxel or (gx.t52_mask & 32) == 0:
             n_s52, d_s52, w_s52 = t52_seeds_voxel(a, b, c, gx, slot, sdf, base, nx, ny, nz, org, inv_voxel, bg)
             if n_s52 > 0:
                 if d_s52 < best:
@@ -3583,7 +3587,7 @@ def tri_sdf_closest_mesh(
         l_b52 = wp.max(wp.length(b - a), wp.length(c - b))
         l_c52 = wp.max(wp.length(c - a), wp.length(c - b))
         lbound52 = wp.max(dg - reach, wp.max(da - l_a52, wp.max(db - l_b52, dc - l_c52)))
-        if lbound52 > cull:
+        if lbound52 > cull and (gx.t52_mask & 32) != 0:
             wp.atomic_add(gx.t52_diag, 4, 1.0)
         else:
             wp.atomic_add(gx.t52_diag, 5, 1.0)
