@@ -1743,14 +1743,15 @@ class Collision:
             + _tolnote
         )
 
-    def _t52_build_edge_seeds(self, device, verts_list, inds_list):
-        """T52: bake the rigid-mesh edge tables + static edge BVHs into ``self.tri_sdf_gx``.
+    def _t52_build_edge_seeds(self, device, verts_list, inds_list, meshes=None):
+        """T52 v3: bake rigid-mesh feature tables into ``self.tri_sdf_gx``.
 
-        ``T52_TRI_SDF_EDGE_SEEDS``: 0 = off (length-1 dummies, nothing read);
-        1 = convex sharp edges (adjacent face normals > 30 deg apart, convex) plus
-        boundary / non-manifold edges; 2 = every edge.  Vertices are welded first
-        (collision meshes are often triangle soups).  Meshes with identical
-        geometry share one table and one BVH.
+        ``T52_TRI_SDF_EDGE_SEEDS`` (int): 0 = off (length-1 dummies, nothing read).
+        Otherwise low 3 bits = category mask (1 = cloth-edge x mesh rays, 2 = mesh
+        edges x triangle, 4 = convex sharp vertices -> plane); +8 = category 2 uses
+        EVERY edge instead of convex sharp (> 30 deg) + boundary edges; 16 alone =
+        tables built with mask 0 (ablation baseline).  Vertices are welded first;
+        meshes with identical geometry share tables and BVHs.
         """
         import hashlib
         import os
@@ -1766,18 +1767,37 @@ class Collision:
             )
         self.t52_mode = mode
         self.t52_bvhs = []
+        mask = mode & 7
+        all_edges = bool(mode & 8)
+        gx.t52_mask = int(mask)
         if mode == 0 or not verts_list:
             gx.t52_p0 = wp.zeros(1, dtype=wp.vec3, device=device)
             gx.t52_p1 = wp.zeros(1, dtype=wp.vec3, device=device)
             gx.t52_n = wp.zeros(1, dtype=wp.vec3, device=device)
             gx.t52_ebase = wp.zeros(nslot, dtype=wp.int32, device=device)
             gx.t52_bvh = wp.zeros(nslot, dtype=wp.uint64, device=device)
+            gx.t52_vp = wp.zeros(1, dtype=wp.vec3, device=device)
+            gx.t52_vn = wp.zeros(1, dtype=wp.vec3, device=device)
+            gx.t52_vbase = wp.zeros(nslot, dtype=wp.int32, device=device)
+            gx.t52_vbvh = wp.zeros(nslot, dtype=wp.uint64, device=device)
+            gx.t52_mesh = wp.zeros(nslot, dtype=wp.uint64, device=device)
+            gx.t52_mask = 0
             print(f"[T52] edge_seeds=0 baked_const={int(_T52_EDGE_SEEDS_BAKED)} (off)", flush=True)
             return
+        if meshes is None or len(meshes) != len(verts_list):
+            raise RuntimeError("[T52] shape meshes are required when T52 is on")
         cos_sharp = float(np.cos(np.deg2rad(30.0)))
-        p0_blocks, p1_blocks, n_blocks, ebase, bvh_ids, seen, counts = [], [], [], [], [], {}, []
-        etot = 0
-        for vertices, indices in zip(verts_list, inds_list):
+        p0_b, p1_b, n_b, vp_b, vn_b = [], [], [], [], []
+        ebase, vbase, bvh_ids, vbvh_ids, mesh_ids, seen = [], [], [], [], [], {}
+        ecounts, vcounts = [], []
+        etot = vtot = 0
+
+        def _bvh(lo, hi):
+            bvh = wp.Bvh(wp.array(lo, dtype=wp.vec3, device=device), wp.array(hi, dtype=wp.vec3, device=device))
+            self.t52_bvhs.append(bvh)
+            return int(bvh.id)
+
+        for vertices, indices, mesh in zip(verts_list, inds_list, meshes):
             V = np.asarray(vertices, dtype=np.float64).reshape(-1, 3)
             F = np.asarray(indices, dtype=np.int64).reshape(-1, 3)
             key = (
@@ -1794,8 +1814,8 @@ class Collision:
                 Fw = inv[F]
                 keep = (Fw[:, 0] != Fw[:, 1]) & (Fw[:, 1] != Fw[:, 2]) & (Fw[:, 0] != Fw[:, 2])
                 Fw = Fw[keep]
-                fn = np.cross(Vw[Fw[:, 1]] - Vw[Fw[:, 0]], Vw[Fw[:, 2]] - Vw[Fw[:, 0]])
-                fn /= np.maximum(np.linalg.norm(fn, axis=1, keepdims=True), 1.0e-30)
+                fnr = np.cross(Vw[Fw[:, 1]] - Vw[Fw[:, 0]], Vw[Fw[:, 2]] - Vw[Fw[:, 0]])
+                fn = fnr / np.maximum(np.linalg.norm(fnr, axis=1, keepdims=True), 1.0e-30)
                 E = np.concatenate([Fw[:, [0, 1]], Fw[:, [1, 2]], Fw[:, [2, 0]]])
                 opp = np.concatenate([Fw[:, 2], Fw[:, 0], Fw[:, 1]])
                 fid = np.tile(np.arange(len(Fw)), 3)
@@ -1808,56 +1828,74 @@ class Collision:
                 gid = np.cumsum(newg) - 1
                 cnt = np.bincount(gid, minlength=len(first))
                 ue = Es[first]
-                # edge pseudo-normal = normalised sum of the adjacent face normals
                 en = np.zeros((len(first), 3), dtype=np.float64)
                 np.add.at(en, gid, fn[fid])
                 en /= np.maximum(np.linalg.norm(en, axis=1, keepdims=True), 1.0e-30)
-                if mode == 1:
-                    sel = cnt != 2  # boundary / non-manifold edges are kept
-                    two = np.nonzero(cnt == 2)[0]
-                    i0 = first[two]
-                    i1 = i0 + 1
-                    n0 = fn[fid[i0]]
-                    n1 = fn[fid[i1]]
-                    cosang = np.einsum("ij,ij->i", n0, n1)
-                    convex = np.einsum("ij,ij->i", Vw[opp[i1]] - Vw[ue[two, 0]], n0) < 0.0
-                    sel[two] = (cosang < cos_sharp) & convex
-                    ue = ue[sel]
-                    en = en[sel]
-                P0 = Vw[ue[:, 0]].astype(np.float32)
-                P1 = Vw[ue[:, 1]].astype(np.float32)
-                EN = en.astype(np.float32)
-                lo = np.minimum(P0, P1) - 1.0e-6
-                hi = np.maximum(P0, P1) + 1.0e-6
-                bvh = wp.Bvh(
-                    wp.array(lo, dtype=wp.vec3, device=device),
-                    wp.array(hi, dtype=wp.vec3, device=device),
-                )
-                self.t52_bvhs.append(bvh)
-                seen[key] = (etot, int(bvh.id))
-                p0_blocks.append(P0)
-                p1_blocks.append(P1)
-                n_blocks.append(EN)
-                counts.append(len(P0))
+                sharp = cnt != 2  # boundary / non-manifold edges count as sharp
+                two = np.nonzero(cnt == 2)[0]
+                i0 = first[two]
+                i1 = i0 + 1
+                n0 = fn[fid[i0]]
+                n1 = fn[fid[i1]]
+                cosang = np.einsum("ij,ij->i", n0, n1)
+                convex = np.einsum("ij,ij->i", Vw[opp[i1]] - Vw[ue[two, 0]], n0) < 0.0
+                sharp[two] = (cosang < cos_sharp) & convex
+                esel = np.ones(len(ue), dtype=bool) if all_edges else sharp
+                P0 = Vw[ue[esel, 0]].astype(np.float32)
+                P1 = Vw[ue[esel, 1]].astype(np.float32)
+                EN = en[esel].astype(np.float32)
+                # convex sharp vertices + angle-weighted vertex pseudo-normals
+                vsel = np.unique(ue[sharp].reshape(-1))
+                vnrm = np.zeros_like(Vw)
+                for k in range(3):
+                    o = Vw[Fw[:, k]]
+                    x1 = Vw[Fw[:, (k + 1) % 3]] - o
+                    x2 = Vw[Fw[:, (k + 2) % 3]] - o
+                    x1 /= np.maximum(np.linalg.norm(x1, axis=1, keepdims=True), 1.0e-30)
+                    x2 /= np.maximum(np.linalg.norm(x2, axis=1, keepdims=True), 1.0e-30)
+                    ang = np.arccos(np.clip((x1 * x2).sum(1), -1.0, 1.0))
+                    np.add.at(vnrm, Fw[:, k], fn * ang[:, None])
+                vnrm /= np.maximum(np.linalg.norm(vnrm, axis=1, keepdims=True), 1.0e-30)
+                VP = Vw[vsel].astype(np.float32)
+                VN = vnrm[vsel].astype(np.float32)
+                ebid = _bvh(np.minimum(P0, P1) - 1.0e-6, np.maximum(P0, P1) + 1.0e-6)
+                vbid = _bvh(VP - 1.0e-6, VP + 1.0e-6)
+                seen[key] = (etot, ebid, vtot, vbid)
+                p0_b.append(P0)
+                p1_b.append(P1)
+                n_b.append(EN)
+                vp_b.append(VP)
+                vn_b.append(VN)
+                ecounts.append(len(P0))
+                vcounts.append(len(VP))
                 etot += len(P0)
-            eb, bid = seen[key]
+                vtot += len(VP)
+            eb, ebid, vb, vbid = seen[key]
             ebase.append(eb)
-            bvh_ids.append(bid)
-        gx.t52_p0 = wp.array(np.concatenate(p0_blocks), dtype=wp.vec3, device=device)
-        gx.t52_p1 = wp.array(np.concatenate(p1_blocks), dtype=wp.vec3, device=device)
-        gx.t52_n = wp.array(np.concatenate(n_blocks), dtype=wp.vec3, device=device)
+            bvh_ids.append(ebid)
+            vbase.append(vb)
+            vbvh_ids.append(vbid)
+            mesh_ids.append(int(mesh.id))
+        gx.t52_p0 = wp.array(np.concatenate(p0_b), dtype=wp.vec3, device=device)
+        gx.t52_p1 = wp.array(np.concatenate(p1_b), dtype=wp.vec3, device=device)
+        gx.t52_n = wp.array(np.concatenate(n_b), dtype=wp.vec3, device=device)
         gx.t52_ebase = wp.array(np.asarray(ebase, dtype=np.int32), dtype=wp.int32, device=device)
         gx.t52_bvh = wp.array(np.asarray(bvh_ids, dtype=np.uint64), dtype=wp.uint64, device=device)
+        gx.t52_vp = wp.array(np.concatenate(vp_b), dtype=wp.vec3, device=device)
+        gx.t52_vn = wp.array(np.concatenate(vn_b), dtype=wp.vec3, device=device)
+        gx.t52_vbase = wp.array(np.asarray(vbase, dtype=np.int32), dtype=wp.int32, device=device)
+        gx.t52_vbvh = wp.array(np.asarray(vbvh_ids, dtype=np.uint64), dtype=wp.uint64, device=device)
+        gx.t52_mesh = wp.array(np.asarray(mesh_ids, dtype=np.uint64), dtype=wp.uint64, device=device)
+        cats = "+".join(n for bit, n in ((1, "b:tri-edge-rays"), (2, "c:mesh-edges"), (4, "d:convex-verts")) if mask & bit) or "none"
         print(
-            f"[T52] edge_seeds={mode} baked_const={int(_T52_EDGE_SEEDS_BAKED)} meshes={len(counts)} "
-            f"edges={counts} ({'convex sharp > 30 deg + boundary' if mode == 1 else 'all edges'}, "
-            f"visit_cap=4096, eval_cap=8, probes mean+0.05/0.2mm inward, static BVH, "
-            f"seeds in force/reaction/projection search)",
+            f"[T52] edge_seeds={mode} baked_const={int(_T52_EDGE_SEEDS_BAKED)} mask={mask} cats={cats} "
+            f"meshes={len(ecounts)} edges={ecounts} ({'all' if all_edges else 'convex sharp > 30 deg + boundary'}) "
+            f"convex_verts={vcounts} visit_cap={65536} eval_cap=16 (overflow counts in read_t52_diag [0],[3])",
             flush=True,
         )
 
     def read_t52_diag(self, reset: bool = False):
-        """T52 diagnostic: [visit-cap overflows, seeds found, seeds accepted, 0]."""
+        """T52 diagnostic: [edge-visit overflows, triangles probed, seeds accepted, vertex-visit overflows]."""
         gx = getattr(self, "tri_sdf_gx", None)
         if gx is None or getattr(gx, "t52_diag", None) is None:
             return None
@@ -2413,7 +2451,7 @@ class Collision:
             device, gx_verts, gx_inds, meshes, float(pad), float(bake_max_dist), float(voxel)
         )
         # T52: edge-crossing seed tables (dummies when off; always after the gx build)
-        self._t52_build_edge_seeds(device, gx_verts, gx_inds)
+        self._t52_build_edge_seeds(device, gx_verts, gx_inds, meshes)
         _exact = int(__import__("os").environ.get("R16_SDF_EXACT", "0"))
         print(
             "[collision] tri-SDF query backend = "

@@ -353,10 +353,16 @@ _T52_EDGE_SEEDS = wp.constant(
 )
 # 每三角最多访问的候选棱数（固定上限，溢出计数进 gx.t52_diag[0]）。门 1 v1：全部棱档
 # 刀尖附近三角的候选有 478–543 条，256 会截掉交点 ⇒ 4096。
-_T52_VISIT_CAP = wp.constant(4096)
-# 每三角最多对多少个交点做「沿棱伪法向往刀内侧偏移」的场评估（每个交点 2 个偏移量）。
+_T52_VISIT_CAP = wp.constant(65536)
+# 每三角最多对多少个棱交点做「沿棱伪法向往刀内侧偏移」的场评估（每个交点 2 个偏移量）。
 # 门 1 v1：只用交点平均时，交点少或孤岛被三角边界截断，平均点落在刀面上（d≈0）判未穿。
-_T52_EVAL_CAP = wp.constant(8)
+_T52_EVAL_CAP = wp.constant(16)
+# 门 1 v3：种子类别改为运行时位掩码 gx.t52_mask（不重编译即可逐类消融）：
+#   1 = (b) 布三角三条边 × 刀网格（mesh_query_ray 双向取进入点，往里偏 0.05/0.2 mm）
+#   2 = (c) 刀网格棱 × 布三角内部（交点平均 + 每交点两个面内往刀内侧偏移探针）
+#   4 = (d) 刀网格凸锐顶点 → 布三角平面（垂足、沿顶点伪法向轴线与平面交点，落在三角内才评估）
+# (a) 质心 + 三顶点种子始终在。环境变量 T52_TRI_SDF_EDGE_SEEDS 的低 3 位即掩码；+8 = (c) 用全部棱
+# （否则只用凸锐棱 > 30° + 边界棱）；16 = 表建好但掩码为 0（消融基线）。
 
 # T16 SOFT: make the choice of contact point CONTINUOUS instead of a switch.
 #
@@ -526,7 +532,16 @@ class SdfGridExact:
     t52_n: wp.array(dtype=wp.vec3)
     t52_ebase: wp.array(dtype=wp.int32)
     t52_bvh: wp.array(dtype=wp.uint64)
+    # [0] edge-visit overflows [1] triangles with >=1 probe [2] seeds accepted [3] vertex-visit overflows
     t52_diag: wp.array(dtype=float)
+    # convex sharp vertices + angle-weighted pseudo-normals, static point BVH per slot
+    t52_vp: wp.array(dtype=wp.vec3)
+    t52_vn: wp.array(dtype=wp.vec3)
+    t52_vbase: wp.array(dtype=wp.int32)
+    t52_vbvh: wp.array(dtype=wp.uint64)
+    # per-slot shape mesh (ray queries from the voxel-path projection kernel)
+    t52_mesh: wp.array(dtype=wp.uint64)
+    t52_mask: int
 
 
 @wp.func
@@ -591,6 +606,17 @@ def t52_inward(ne: wp.vec3, e1: wp.vec3, e2: wp.vec3):
 
 
 @wp.func
+def t52_edge_bary(k: int, tau: float):
+    """Barycentric point at fraction tau along cloth-triangle edge k (0: a->b, 1: b->c, 2: c->a)."""
+    w = wp.vec3(1.0 - tau, tau, 0.0)
+    if k == 1:
+        w = wp.vec3(0.0, 1.0 - tau, tau)
+    if k == 2:
+        w = wp.vec3(tau, 0.0, 1.0 - tau)
+    return w
+
+
+@wp.func
 def t52_seeds_exact(
     a: wp.vec3,
     b: wp.vec3,
@@ -601,61 +627,146 @@ def t52_seeds_exact(
     rq: float,
     bg: float,
 ):
-    """T52 seeds on the exact field.  Every rigid edge crossing the triangle
-    contributes: the mean of all crossings, and for the first _T52_EVAL_CAP
-    crossings two in-plane probes offset 0.05 / 0.2 mm into the solid along the
-    edge's pseudo-normal.  Returns (n_crossings, best d, best w, best normal)."""
-    pad = wp.vec3(1.0e-5, 1.0e-5, 1.0e-5)
-    lo = wp.min(wp.min(a, b), c) - pad
-    hi = wp.max(wp.max(a, b), c) + pad
-    ebase = gx.t52_ebase[slot]
-    e1 = b - a
-    e2 = c - a
+    """T52 v3 seeds on the exact field, categories by ``gx.t52_mask``:
+    (b) cloth-triangle edges x rigid mesh: ray each edge both ways, probe 0.05/0.2 mm past each ENTRY;
+    (c) rigid edges x triangle interior: mean of crossings + two in-plane probes per crossing;
+    (d) convex sharp rigid vertices: foot on the triangle plane and the plane point on the vertex
+        pseudo-normal axis, if inside the triangle.
+    Returns (n_probed, best d, best w, best normal); n_probed == 0 -> nothing evaluated."""
     best = bg
     wbest = wp.vec3(0.0)
     nbest = wp.vec3(0.0, 0.0, 1.0)
-    acc = wp.vec3(0.0)
-    cnt = int(0)
-    nev = int(0)
-    visit = int(0)
-    idx = int(0)
-    q = wp.bvh_query_aabb(gx.t52_bvh[slot], lo, hi)
-    while wp.bvh_query_next(q, idx):
-        visit = visit + 1
-        if visit > _T52_VISIT_CAP:
-            wp.atomic_add(gx.t52_diag, 0, 1.0)
-            break
-        p0 = gx.t52_p0[ebase + idx]
-        hit, u, v = t52_cross(p0, gx.t52_p1[ebase + idx] - p0, a, e1, e2)
-        if hit != 0:
-            acc = acc + wp.vec3(1.0 - u - v, u, v)
-            cnt = cnt + 1
-            if nev < _T52_EVAL_CAP:
-                nev = nev + 1
-                okd, inw = t52_inward(gx.t52_n[ebase + idx], e1, e2)
-                if okd != 0:
-                    x = a + e1 * u + e2 * v
-                    for k in range(2):
-                        delta = float(5.0e-5)
-                        if k == 1:
-                            delta = 2.0e-4
-                        pk = x + inw * delta
+    found = int(0)
+    e1 = b - a
+    e2 = c - a
+    nt = wp.cross(e1, e2)
+    lnt = wp.length(nt)
+    mask = gx.t52_mask
+    if lnt > 1.0e-20:
+        nn = nt / lnt
+        # ---- (b) triangle edges x mesh
+        if (mask & 1) != 0:
+            for k in range(3):
+                p = a
+                qd = b - a
+                if k == 1:
+                    p = b
+                    qd = c - b
+                if k == 2:
+                    p = c
+                    qd = a - c
+                L = wp.length(qd)
+                if L > 1.0e-12:
+                    dv = qd / L
+                    for side in range(2):
+                        s0 = p
+                        sdv = dv
+                        if side == 1:
+                            s0 = p + qd
+                            sdv = -dv
+                        hq = wp.mesh_query_ray(mesh, s0, sdv, L)
+                        if hq.result:
+                            if wp.dot(sdv, hq.normal) < 0.0:
+                                for j in range(2):
+                                    delta = float(5.0e-5)
+                                    if j == 1:
+                                        delta = 2.0e-4
+                                    sdist = hq.t + delta
+                                    if sdist < L:
+                                        tau = sdist / L
+                                        if side == 1:
+                                            tau = 1.0 - tau
+                                        wk = t52_edge_bary(k, tau)
+                                        pk = a * wk[0] + b * wk[1] + c * wk[2]
+                                        found = found + 1
+                                        dk, nk = sdf_query(mesh, gx, slot, rq, bg, pk)
+                                        if dk < best:
+                                            best = dk
+                                            wbest = wk
+                                            nbest = nk
+        pad = wp.vec3(1.0e-5, 1.0e-5, 1.0e-5)
+        lo = wp.min(wp.min(a, b), c) - pad
+        hi = wp.max(wp.max(a, b), c) + pad
+        # ---- (c) mesh edges x triangle interior
+        if (mask & 2) != 0:
+            ebase = gx.t52_ebase[slot]
+            acc = wp.vec3(0.0)
+            cnt = int(0)
+            nev = int(0)
+            visit = int(0)
+            idx = int(0)
+            q = wp.bvh_query_aabb(gx.t52_bvh[slot], lo, hi)
+            while wp.bvh_query_next(q, idx):
+                visit = visit + 1
+                if visit > _T52_VISIT_CAP:
+                    wp.atomic_add(gx.t52_diag, 0, 1.0)
+                    break
+                p0 = gx.t52_p0[ebase + idx]
+                hit, u, v = t52_cross(p0, gx.t52_p1[ebase + idx] - p0, a, e1, e2)
+                if hit != 0:
+                    acc = acc + wp.vec3(1.0 - u - v, u, v)
+                    cnt = cnt + 1
+                    if nev < _T52_EVAL_CAP:
+                        nev = nev + 1
+                        okd, inw = t52_inward(gx.t52_n[ebase + idx], e1, e2)
+                        if okd != 0:
+                            x = a + e1 * u + e2 * v
+                            for j in range(2):
+                                delta = float(5.0e-5)
+                                if j == 1:
+                                    delta = 2.0e-4
+                                pk = x + inw * delta
+                                ins, wk = t52_bary_in(pk, a, e1, e2)
+                                if ins != 0:
+                                    found = found + 1
+                                    dk, nk = sdf_query(mesh, gx, slot, rq, bg, pk)
+                                    if dk < best:
+                                        best = dk
+                                        wbest = wk
+                                        nbest = nk
+            if cnt > 0:
+                wa = acc / float(cnt)
+                pa = a * wa[0] + b * wa[1] + c * wa[2]
+                found = found + 1
+                da, na = sdf_query(mesh, gx, slot, rq, bg, pa)
+                if da < best:
+                    best = da
+                    wbest = wa
+                    nbest = na
+        # ---- (d) convex sharp vertices -> triangle plane
+        if (mask & 4) != 0:
+            padv = wp.vec3(1.0e-3, 1.0e-3, 1.0e-3)
+            vbase = gx.t52_vbase[slot]
+            vvisit = int(0)
+            vi = int(0)
+            vq = wp.bvh_query_aabb(gx.t52_vbvh[slot], lo - padv, hi + padv)
+            while wp.bvh_query_next(vq, vi):
+                vvisit = vvisit + 1
+                if vvisit > _T52_VISIT_CAP:
+                    wp.atomic_add(gx.t52_diag, 3, 1.0)
+                    break
+                vp = gx.t52_vp[vbase + vi]
+                hgt = wp.dot(vp - a, nn)
+                for j in range(2):
+                    pk = vp - nn * hgt
+                    okj = int(1)
+                    if j == 1:
+                        okj = 0
+                        vnrm = gx.t52_vn[vbase + vi]
+                        den = wp.dot(vnrm, nn)
+                        if wp.abs(den) > 0.2:
+                            pk = vp - vnrm * (hgt / den)
+                            okj = 1
+                    if okj != 0:
                         ins, wk = t52_bary_in(pk, a, e1, e2)
                         if ins != 0:
+                            found = found + 1
                             dk, nk = sdf_query(mesh, gx, slot, rq, bg, pk)
                             if dk < best:
                                 best = dk
                                 wbest = wk
                                 nbest = nk
-    if cnt > 0:
-        wa = acc / float(cnt)
-        pa = a * wa[0] + b * wa[1] + c * wa[2]
-        da, na = sdf_query(mesh, gx, slot, rq, bg, pa)
-        if da < best:
-            best = da
-            wbest = wa
-            nbest = na
-    return cnt, best, wbest, nbest
+    return found, best, wbest, nbest
 
 
 @wp.func
@@ -674,54 +785,132 @@ def t52_seeds_voxel(
     inv_voxel: float,
     bg: float,
 ):
-    """Same probes as ``t52_seeds_exact`` on the trilinear voxel field (projection kernel)."""
-    pad = wp.vec3(1.0e-5, 1.0e-5, 1.0e-5)
-    lo = wp.min(wp.min(a, b), c) - pad
-    hi = wp.max(wp.max(a, b), c) + pad
-    ebase = gx.t52_ebase[slot]
-    e1 = b - a
-    e2 = c - a
+    """Same probes as ``t52_seeds_exact``, evaluated on the trilinear voxel field (projection kernel)."""
     best = bg
     wbest = wp.vec3(0.0)
-    acc = wp.vec3(0.0)
-    cnt = int(0)
-    nev = int(0)
-    visit = int(0)
-    idx = int(0)
-    q = wp.bvh_query_aabb(gx.t52_bvh[slot], lo, hi)
-    while wp.bvh_query_next(q, idx):
-        visit = visit + 1
-        if visit > _T52_VISIT_CAP:
-            break
-        p0 = gx.t52_p0[ebase + idx]
-        hit, u, v = t52_cross(p0, gx.t52_p1[ebase + idx] - p0, a, e1, e2)
-        if hit != 0:
-            acc = acc + wp.vec3(1.0 - u - v, u, v)
-            cnt = cnt + 1
-            if nev < _T52_EVAL_CAP:
-                nev = nev + 1
-                okd, inw = t52_inward(gx.t52_n[ebase + idx], e1, e2)
-                if okd != 0:
-                    x = a + e1 * u + e2 * v
-                    for k in range(2):
-                        delta = float(5.0e-5)
-                        if k == 1:
-                            delta = 2.0e-4
-                        pk = x + inw * delta
+    found = int(0)
+    e1 = b - a
+    e2 = c - a
+    nt = wp.cross(e1, e2)
+    lnt = wp.length(nt)
+    mask = gx.t52_mask
+    mesh = gx.t52_mesh[slot]
+    if lnt > 1.0e-20:
+        nn = nt / lnt
+        if (mask & 1) != 0:
+            for k in range(3):
+                p = a
+                qd = b - a
+                if k == 1:
+                    p = b
+                    qd = c - b
+                if k == 2:
+                    p = c
+                    qd = a - c
+                L = wp.length(qd)
+                if L > 1.0e-12:
+                    dv = qd / L
+                    for side in range(2):
+                        s0 = p
+                        sdv = dv
+                        if side == 1:
+                            s0 = p + qd
+                            sdv = -dv
+                        hq = wp.mesh_query_ray(mesh, s0, sdv, L)
+                        if hq.result:
+                            if wp.dot(sdv, hq.normal) < 0.0:
+                                for j in range(2):
+                                    delta = float(5.0e-5)
+                                    if j == 1:
+                                        delta = 2.0e-4
+                                    sdist = hq.t + delta
+                                    if sdist < L:
+                                        tau = sdist / L
+                                        if side == 1:
+                                            tau = 1.0 - tau
+                                        wk = t52_edge_bary(k, tau)
+                                        pk = a * wk[0] + b * wk[1] + c * wk[2]
+                                        found = found + 1
+                                        dk = sdf_grid_sample(sdf, base, nx, ny, nz, org, inv_voxel, bg, pk)
+                                        if dk < best:
+                                            best = dk
+                                            wbest = wk
+        pad = wp.vec3(1.0e-5, 1.0e-5, 1.0e-5)
+        lo = wp.min(wp.min(a, b), c) - pad
+        hi = wp.max(wp.max(a, b), c) + pad
+        if (mask & 2) != 0:
+            ebase = gx.t52_ebase[slot]
+            acc = wp.vec3(0.0)
+            cnt = int(0)
+            nev = int(0)
+            visit = int(0)
+            idx = int(0)
+            q = wp.bvh_query_aabb(gx.t52_bvh[slot], lo, hi)
+            while wp.bvh_query_next(q, idx):
+                visit = visit + 1
+                if visit > _T52_VISIT_CAP:
+                    break
+                p0 = gx.t52_p0[ebase + idx]
+                hit, u, v = t52_cross(p0, gx.t52_p1[ebase + idx] - p0, a, e1, e2)
+                if hit != 0:
+                    acc = acc + wp.vec3(1.0 - u - v, u, v)
+                    cnt = cnt + 1
+                    if nev < _T52_EVAL_CAP:
+                        nev = nev + 1
+                        okd, inw = t52_inward(gx.t52_n[ebase + idx], e1, e2)
+                        if okd != 0:
+                            x = a + e1 * u + e2 * v
+                            for j in range(2):
+                                delta = float(5.0e-5)
+                                if j == 1:
+                                    delta = 2.0e-4
+                                pk = x + inw * delta
+                                ins, wk = t52_bary_in(pk, a, e1, e2)
+                                if ins != 0:
+                                    found = found + 1
+                                    dk = sdf_grid_sample(sdf, base, nx, ny, nz, org, inv_voxel, bg, pk)
+                                    if dk < best:
+                                        best = dk
+                                        wbest = wk
+            if cnt > 0:
+                wa = acc / float(cnt)
+                pa = a * wa[0] + b * wa[1] + c * wa[2]
+                found = found + 1
+                da = sdf_grid_sample(sdf, base, nx, ny, nz, org, inv_voxel, bg, pa)
+                if da < best:
+                    best = da
+                    wbest = wa
+        if (mask & 4) != 0:
+            padv = wp.vec3(1.0e-3, 1.0e-3, 1.0e-3)
+            vbase = gx.t52_vbase[slot]
+            vvisit = int(0)
+            vi = int(0)
+            vq = wp.bvh_query_aabb(gx.t52_vbvh[slot], lo - padv, hi + padv)
+            while wp.bvh_query_next(vq, vi):
+                vvisit = vvisit + 1
+                if vvisit > _T52_VISIT_CAP:
+                    break
+                vp = gx.t52_vp[vbase + vi]
+                hgt = wp.dot(vp - a, nn)
+                for j in range(2):
+                    pk = vp - nn * hgt
+                    okj = int(1)
+                    if j == 1:
+                        okj = 0
+                        vnrm = gx.t52_vn[vbase + vi]
+                        den = wp.dot(vnrm, nn)
+                        if wp.abs(den) > 0.2:
+                            pk = vp - vnrm * (hgt / den)
+                            okj = 1
+                    if okj != 0:
                         ins, wk = t52_bary_in(pk, a, e1, e2)
                         if ins != 0:
+                            found = found + 1
                             dk = sdf_grid_sample(sdf, base, nx, ny, nz, org, inv_voxel, bg, pk)
                             if dk < best:
                                 best = dk
                                 wbest = wk
-    if cnt > 0:
-        wa = acc / float(cnt)
-        pa = a * wa[0] + b * wa[1] + c * wa[2]
-        da = sdf_grid_sample(sdf, base, nx, ny, nz, org, inv_voxel, bg, pa)
-        if da < best:
-            best = da
-            wbest = wa
-    return cnt, best, wbest
+    return found, best, wbest
 
 
 @wp.kernel
