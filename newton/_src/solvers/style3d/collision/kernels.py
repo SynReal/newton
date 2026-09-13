@@ -351,8 +351,12 @@ _T42_TRI_DEEP_ONLY = wp.constant(float(__import__("os").environ.get("T42_TRI_DEE
 _T52_EDGE_SEEDS = wp.constant(
     1 if int(__import__("os").environ.get("T52_TRI_SDF_EDGE_SEEDS", "0") or 0) != 0 else 0
 )
-# 每三角最多访问的候选棱数（固定上限，溢出计数进 gx.t52_diag[0]）。
-_T52_VISIT_CAP = wp.constant(256)
+# 每三角最多访问的候选棱数（固定上限，溢出计数进 gx.t52_diag[0]）。门 1 v1：全部棱档
+# 刀尖附近三角的候选有 478–543 条，256 会截掉交点 ⇒ 4096。
+_T52_VISIT_CAP = wp.constant(4096)
+# 每三角最多对多少个交点做「沿棱伪法向往刀内侧偏移」的场评估（每个交点 2 个偏移量）。
+# 门 1 v1：只用交点平均时，交点少或孤岛被三角边界截断，平均点落在刀面上（d≈0）判未穿。
+_T52_EVAL_CAP = wp.constant(8)
 
 # T16 SOFT: make the choice of contact point CONTINUOUS instead of a switch.
 #
@@ -519,32 +523,100 @@ class SdfGridExact:
     # [0] visit-cap overflows [1] seeds found [2] seeds accepted.
     t52_p0: wp.array(dtype=wp.vec3)
     t52_p1: wp.array(dtype=wp.vec3)
+    t52_n: wp.array(dtype=wp.vec3)
     t52_ebase: wp.array(dtype=wp.int32)
     t52_bvh: wp.array(dtype=wp.uint64)
     t52_diag: wp.array(dtype=float)
 
 
 @wp.func
-def t52_edge_seed(
+def t52_cross(p0: wp.vec3, d: wp.vec3, a: wp.vec3, e1: wp.vec3, e2: wp.vec3):
+    """Segment p0 -> p0 + d against triangle (a, a + e1, a + e2): (hit, u, v), point = a + u e1 + v e2."""
+    hit = int(0)
+    u = float(0.0)
+    v = float(0.0)
+    hv = wp.cross(d, e2)
+    det = wp.dot(e1, hv)
+    if wp.abs(det) > 1.0e-30:
+        inv = 1.0 / det
+        s = p0 - a
+        u = inv * wp.dot(s, hv)
+        if u >= 0.0 and u <= 1.0:
+            qv = wp.cross(s, e1)
+            v = inv * wp.dot(d, qv)
+            if v >= 0.0 and u + v <= 1.0:
+                tt = inv * wp.dot(e2, qv)
+                if tt >= 0.0 and tt <= 1.0:
+                    hit = 1
+    return hit, u, v
+
+
+@wp.func
+def t52_bary_in(p: wp.vec3, a: wp.vec3, e1: wp.vec3, e2: wp.vec3):
+    """Barycentric coordinates of in-plane point p; (1, w) if inside the triangle, else (0, 0)."""
+    ins = int(0)
+    w = wp.vec3(0.0)
+    v2 = p - a
+    d00 = wp.dot(e1, e1)
+    d01 = wp.dot(e1, e2)
+    d11 = wp.dot(e2, e2)
+    d20 = wp.dot(v2, e1)
+    d21 = wp.dot(v2, e2)
+    den = d00 * d11 - d01 * d01
+    if wp.abs(den) > 1.0e-30:
+        s1 = (d11 * d20 - d01 * d21) / den
+        s2 = (d00 * d21 - d01 * d20) / den
+        if s1 >= 0.0 and s2 >= 0.0 and s1 + s2 <= 1.0:
+            ins = 1
+            w = wp.vec3(1.0 - s1 - s2, s1, s2)
+    return ins, w
+
+
+@wp.func
+def t52_inward(ne: wp.vec3, e1: wp.vec3, e2: wp.vec3):
+    """In-plane direction pointing INTO the solid at a crossing: minus the edge
+    pseudo-normal with its triangle-normal component removed.  (0, 0) if degenerate."""
+    ok = int(0)
+    nt = wp.cross(e1, e2)
+    ln = wp.length(nt)
+    dirv = wp.vec3(0.0)
+    if ln > 1.0e-20:
+        nn = nt / ln
+        dirv = -(ne - nn * wp.dot(ne, nn))
+        li = wp.length(dirv)
+        if li > 1.0e-6:
+            dirv = dirv / li
+            ok = 1
+    return ok, dirv
+
+
+@wp.func
+def t52_seeds_exact(
     a: wp.vec3,
     b: wp.vec3,
     c: wp.vec3,
+    mesh: wp.uint64,
     gx: SdfGridExact,
     slot: int,
+    rq: float,
+    bg: float,
 ):
-    """T52: average barycentric point where the shape's edges cross triangle (a, b, c).
-
-    All inputs in the shape's local frame.  Returns (count, w); count == 0 means
-    no edge crosses the triangle and ``w`` must not be used.
-    """
+    """T52 seeds on the exact field.  Every rigid edge crossing the triangle
+    contributes: the mean of all crossings, and for the first _T52_EVAL_CAP
+    crossings two in-plane probes offset 0.05 / 0.2 mm into the solid along the
+    edge's pseudo-normal.  Returns (n_crossings, best d, best w, best normal)."""
     pad = wp.vec3(1.0e-5, 1.0e-5, 1.0e-5)
     lo = wp.min(wp.min(a, b), c) - pad
     hi = wp.max(wp.max(a, b), c) + pad
-    base = gx.t52_ebase[slot]
+    ebase = gx.t52_ebase[slot]
     e1 = b - a
     e2 = c - a
+    best = bg
+    wbest = wp.vec3(0.0)
+    nbest = wp.vec3(0.0, 0.0, 1.0)
     acc = wp.vec3(0.0)
     cnt = int(0)
+    nev = int(0)
     visit = int(0)
     idx = int(0)
     q = wp.bvh_query_aabb(gx.t52_bvh[slot], lo, hi)
@@ -553,26 +625,103 @@ def t52_edge_seed(
         if visit > _T52_VISIT_CAP:
             wp.atomic_add(gx.t52_diag, 0, 1.0)
             break
-        p0 = gx.t52_p0[base + idx]
-        d = gx.t52_p1[base + idx] - p0
-        hv = wp.cross(d, e2)
-        det = wp.dot(e1, hv)
-        if wp.abs(det) > 1.0e-30:
-            inv = 1.0 / det
-            s = p0 - a
-            u = inv * wp.dot(s, hv)
-            if u >= 0.0 and u <= 1.0:
-                qv = wp.cross(s, e1)
-                v = inv * wp.dot(d, qv)
-                if v >= 0.0 and u + v <= 1.0:
-                    tt = inv * wp.dot(e2, qv)
-                    if tt >= 0.0 and tt <= 1.0:
-                        acc = acc + wp.vec3(1.0 - u - v, u, v)
-                        cnt = cnt + 1
-    w = wp.vec3(0.0)
+        p0 = gx.t52_p0[ebase + idx]
+        hit, u, v = t52_cross(p0, gx.t52_p1[ebase + idx] - p0, a, e1, e2)
+        if hit != 0:
+            acc = acc + wp.vec3(1.0 - u - v, u, v)
+            cnt = cnt + 1
+            if nev < _T52_EVAL_CAP:
+                nev = nev + 1
+                okd, inw = t52_inward(gx.t52_n[ebase + idx], e1, e2)
+                if okd != 0:
+                    x = a + e1 * u + e2 * v
+                    for k in range(2):
+                        delta = float(5.0e-5)
+                        if k == 1:
+                            delta = 2.0e-4
+                        pk = x + inw * delta
+                        ins, wk = t52_bary_in(pk, a, e1, e2)
+                        if ins != 0:
+                            dk, nk = sdf_query(mesh, gx, slot, rq, bg, pk)
+                            if dk < best:
+                                best = dk
+                                wbest = wk
+                                nbest = nk
     if cnt > 0:
-        w = acc / float(cnt)
-    return cnt, w
+        wa = acc / float(cnt)
+        pa = a * wa[0] + b * wa[1] + c * wa[2]
+        da, na = sdf_query(mesh, gx, slot, rq, bg, pa)
+        if da < best:
+            best = da
+            wbest = wa
+            nbest = na
+    return cnt, best, wbest, nbest
+
+
+@wp.func
+def t52_seeds_voxel(
+    a: wp.vec3,
+    b: wp.vec3,
+    c: wp.vec3,
+    gx: SdfGridExact,
+    slot: int,
+    sdf: wp.array(dtype=float),
+    base: int,
+    nx: int,
+    ny: int,
+    nz: int,
+    org: wp.vec3,
+    inv_voxel: float,
+    bg: float,
+):
+    """Same probes as ``t52_seeds_exact`` on the trilinear voxel field (projection kernel)."""
+    pad = wp.vec3(1.0e-5, 1.0e-5, 1.0e-5)
+    lo = wp.min(wp.min(a, b), c) - pad
+    hi = wp.max(wp.max(a, b), c) + pad
+    ebase = gx.t52_ebase[slot]
+    e1 = b - a
+    e2 = c - a
+    best = bg
+    wbest = wp.vec3(0.0)
+    acc = wp.vec3(0.0)
+    cnt = int(0)
+    nev = int(0)
+    visit = int(0)
+    idx = int(0)
+    q = wp.bvh_query_aabb(gx.t52_bvh[slot], lo, hi)
+    while wp.bvh_query_next(q, idx):
+        visit = visit + 1
+        if visit > _T52_VISIT_CAP:
+            break
+        p0 = gx.t52_p0[ebase + idx]
+        hit, u, v = t52_cross(p0, gx.t52_p1[ebase + idx] - p0, a, e1, e2)
+        if hit != 0:
+            acc = acc + wp.vec3(1.0 - u - v, u, v)
+            cnt = cnt + 1
+            if nev < _T52_EVAL_CAP:
+                nev = nev + 1
+                okd, inw = t52_inward(gx.t52_n[ebase + idx], e1, e2)
+                if okd != 0:
+                    x = a + e1 * u + e2 * v
+                    for k in range(2):
+                        delta = float(5.0e-5)
+                        if k == 1:
+                            delta = 2.0e-4
+                        pk = x + inw * delta
+                        ins, wk = t52_bary_in(pk, a, e1, e2)
+                        if ins != 0:
+                            dk = sdf_grid_sample(sdf, base, nx, ny, nz, org, inv_voxel, bg, pk)
+                            if dk < best:
+                                best = dk
+                                wbest = wk
+    if cnt > 0:
+        wa = acc / float(cnt)
+        pa = a * wa[0] + b * wa[1] + c * wa[2]
+        da = sdf_grid_sample(sdf, base, nx, ny, nz, org, inv_voxel, bg, pa)
+        if da < best:
+            best = da
+            wbest = wa
+    return cnt, best, wbest
 
 
 @wp.kernel
@@ -2699,10 +2848,8 @@ def project_tri_sdf_kernel(
         w = wp.vec3(0.0, 0.0, 1.0)
     if _T52_EDGE_SEEDS != 0:
         # T52: same edge-crossing seed as tri_sdf_closest_mesh, on this kernel's field
-        n_s52, w_s52 = t52_edge_seed(a, b, c, gx, slot)
+        n_s52, d_s52, w_s52 = t52_seeds_voxel(a, b, c, gx, slot, sdf, base, nx, ny, nz, org, inv_voxel, bg)
         if n_s52 > 0:
-            p_s52 = a * w_s52[0] + b * w_s52[1] + c * w_s52[2]
-            d_s52 = sdf_grid_sample(sdf, base, nx, ny, nz, org, inv_voxel, bg, p_s52)
             if d_s52 < best:
                 best = d_s52
                 w = w_s52
@@ -3231,18 +3378,16 @@ def tri_sdf_closest_mesh(
         # mean of those crossings sits inside the small SDF<0 island the four
         # seeds above cannot reach.  Strictly-deeper acceptance, then the same
         # refinement.
-        n_s52, w_s52 = t52_edge_seed(a, b, c, gx, slot)
+        n_s52, d_s52, w_s52, nn_s52 = t52_seeds_exact(a, b, c, mesh, gx, slot, rq, bg)
         if n_s52 > 0:
             wp.atomic_add(gx.t52_diag, 1, 1.0)
-            p_s52 = a * w_s52[0] + b * w_s52[1] + c * w_s52[2]
-            d_s52, nn_s52 = sdf_query(mesh, gx, slot, rq, bg, p_s52)
             if d_s52 < best - tol:
                 wp.atomic_add(gx.t52_diag, 2, 1.0)
                 best = d_s52
                 w = w_s52
                 nbest = nn_s52
                 if _T14_SDF_SKIPREF != 0:
-                    p_best = p_s52
+                    p_best = a * w_s52[0] + b * w_s52[1] + c * w_s52[2]
     if _T16_SDF_ARGMIN_SOFT != 0.0:
         # softmin over the four seeds -> a CONTINUOUS starting point, then the
         # same descent from there.  One extra field evaluation (at the blend).
