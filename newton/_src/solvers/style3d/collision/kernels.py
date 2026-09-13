@@ -4167,6 +4167,15 @@ def eval_tri_sdf_contact_kernel(
         else:
             if bp_overflow[0] == 0:
                 return
+    if _T59_SEED_PASS != 0:
+        if anchor_seed != 0:
+            # T59 v3: iteration 0 -- K1 already ran tri_sdf_closest_mesh's centroid rejection on exactly
+            # these inputs (same pos / body_q arrays, verbatim expressions).  A rejected pair here would
+            # return from the search with best >= bg and reach only the anchor drop below; do just that.
+            if gx.t59_pairk[pair] == -1:
+                if anchor_kt_ratio > 0.0:
+                    anchor_valid[pair] = 0
+                return
     slot = pair / tri_count
     t = pair - slot * tri_count
 
