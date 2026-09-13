@@ -1809,7 +1809,8 @@ class Collision:
         gx.t59_rd = wp.zeros(_np59, dtype=float, device=device)
         gx.t59_rw = wp.zeros(_np59, dtype=wp.vec3, device=device)
         gx.t59_rnn = wp.zeros(_np59, dtype=wp.vec3, device=device)
-        gx.t59_diag = wp.zeros(3, dtype=float, device=device)
+        # [0..2] seed pass, [3..9] zero-weight diagnostic (T59_ZW_DIAG), see kernels.py
+        gx.t59_diag = wp.zeros(10, dtype=float, device=device)
         self.t59_seed_pass = bool(_t59_on)
         if _t59_req != 0 and not _t59_on:
             print(f"[T59] seed_pass requested={_t59_req} but INACTIVE (baked={int(_T59_SEED_PASS_BAKED)} t52_mode={mode})", flush=True)

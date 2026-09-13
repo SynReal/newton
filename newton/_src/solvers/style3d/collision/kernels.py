@@ -377,6 +377,12 @@ _T59_SEED_PASS = wp.constant(
 )
 # 每个候选对最多存多少个探针（c 类最多 16×3 + 1 个均值点，d 类每顶点 2 个；超出的对走 K1 串行）
 _T59_SEED_K = wp.constant(int(__import__("os").environ.get("T59_SEED_K", "64") or 64))
+# T59 零权重诊断（默认 0 = OFF，codegen 折叠；ON 只写 gx.t59_diag，不进任何力 / 位置表达式）：
+# F2 v4 在「found>0 但所有探针返回 bg」时把 w=(0,0,0) 写进缓存且 cvalid=1；迭代>=1 / 反作用 / 投影
+# 读到它时求出的点是刀 shape 局部原点（实测在刀网格表面，d≈0）。计数：
+#   [3] mode-2 接受 w=0 缓存点  [4] 其中 d<h  [5] 反作用核 best<h 且 w=0  [6] 其 f_n 累加（刀侧假力 N）
+#   [7] 力核 best<h 且 w=0  [8] 投影核接受 w=0 缓存点  [9] 力核 w=0 时 depth 累加（m）
+_T59_ZW_DIAG = wp.constant(int(__import__("os").environ.get("T59_ZW_DIAG", "0") or 0))
 # 门 1 v3：种子类别改为运行时位掩码 gx.t52_mask（不重编译即可逐类消融）：
 #   1 = (b) 布三角三条边 × 刀网格（mesh_query_ray 双向取进入点，往里偏 0.05/0.2 mm）
 #   2 = (c) 刀网格棱 × 布三角内部（交点平均 + 每交点两个面内往刀内侧偏移探针）
@@ -3360,6 +3366,9 @@ def project_tri_sdf_kernel(
             if d_c52 < best:
                 best = d_c52
                 w = w_c52
+                if _T59_ZW_DIAG != 0:
+                    if w_c52[0] == 0.0 and w_c52[1] == 0.0 and w_c52[2] == 0.0:
+                        wp.atomic_add(gx.t59_diag, 8, 1.0)
     if best >= bg:
         return
 
@@ -3893,6 +3902,11 @@ def tri_sdf_closest_mesh(
                 d_c52, n_c52 = sdf_query(mesh, gx, slot, rq, bg, p_c52)
                 if d_c52 < best - tol:
                     wp.atomic_add(gx.t52_diag, 2, 1.0)
+                    if _T59_ZW_DIAG != 0:
+                        if w_c52[0] == 0.0 and w_c52[1] == 0.0 and w_c52[2] == 0.0:
+                            wp.atomic_add(gx.t59_diag, 3, 1.0)
+                            if d_c52 < cull:
+                                wp.atomic_add(gx.t59_diag, 4, 1.0)
                     best = d_c52
                     w = w_c52
                     nbest = n_c52
@@ -4259,6 +4273,10 @@ def eval_tri_sdf_contact_kernel(
         return
 
     depth = wp.min(half_thickness - best, max_depth)
+    if _T59_ZW_DIAG != 0:
+        if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+            wp.atomic_add(gx.t59_diag, 7, 1.0)
+            wp.atomic_add(gx.t59_diag, 9, depth)
     p = a * w[0] + b * w[1] + c * w[2]
     n_local = wp.vec3(0.0, 0.0, 1.0)
     if _R16_SDF_EXACT != 0:
@@ -5007,6 +5025,10 @@ def accumulate_tri_sdf_reaction_kernel(
             )
     reaction = n_world * (-f_n)
     p_world = wp.transform_point(X_ws, p_local)
+    if _T59_ZW_DIAG != 0:
+        if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+            wp.atomic_add(gx.t59_diag, 5, 1.0)
+            wp.atomic_add(gx.t59_diag, 6, f_n)
     # R13f: the tangential half of the same contact, equal and opposite.
     # Re-evaluated with the identical inputs as the force kernel so the two
     # sides cannot disagree.  OFF branch leaves ``reaction`` untouched.
