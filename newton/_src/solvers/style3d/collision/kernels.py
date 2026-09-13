@@ -383,6 +383,15 @@ _T59_SEED_K = wp.constant(int(__import__("os").environ.get("T59_SEED_K", "64") o
 #   [3] mode-2 接受 w=0 缓存点  [4] 其中 d<h  [5] 反作用核 best<h 且 w=0  [6] 其 f_n 累加（刀侧假力 N）
 #   [7] 力核 best<h 且 w=0  [8] 投影核接受 w=0 缓存点  [9] 力核 w=0 时 depth 累加（m）
 _T59_ZW_DIAG = wp.constant(int(__import__("os").environ.get("T59_ZW_DIAG", "0") or 0))
+#   诊断续:[10] 力核迭代>=1 搜索后 w=0  [11] 力核迭代 0 搜索后 w=0  [12] 反作用核搜索后 w=0
+#   [13] mode-2 接受 w=0 时 d 之和  [14] 其 max d  [15] 其 max(-d)
+#   [16] w=0 时布上法向力散射模长之和(按 w>0 实际施加的那几项)  [17] w=0 时锚切向力散射模长之和
+#   [18] 反作用核 w=0 且 best<h 时 |reaction| 之和(N)  [19] 其 |torque| 之和(N·m)
+#   [20] w=0 时 T8 锚写入(播种/返回映射)  [21] w=0 时 anchor_dbg2 行写入(T22 c_dat)  [22] w=0 时 tail 行写入
+#   [23] w=0 时 fric_diag 累加  [24] 修复开关触发次数  [25] 诊断开时「本应触发」次数(零权重缓存写入)
+# T59 修复开关（默认 0 = OFF，codegen 折叠）：迭代 0 写缓存时 found>0 但种子最优仍 >= bg（全部探针返回 bg，
+# wbest 停在初值 (0,0,0)）⇒ 写 cvalid=0 而不是 1。wbest 初值不改。计数 t59_diag[24]。
+_T59_SEED_CVALID_FIX = wp.constant(int(__import__("os").environ.get("T59_SEED_CVALID_FIX", "0") or 0))
 # 门 1 v3：种子类别改为运行时位掩码 gx.t52_mask（不重编译即可逐类消融）：
 #   1 = (b) 布三角三条边 × 刀网格（mesh_query_ray 双向取进入点，往里偏 0.05/0.2 mm）
 #   2 = (c) 刀网格棱 × 布三角内部（交点平均 + 每交点两个面内往刀内侧偏移探针）
@@ -3907,6 +3916,9 @@ def tri_sdf_closest_mesh(
                             wp.atomic_add(gx.t59_diag, 3, 1.0)
                             if d_c52 < cull:
                                 wp.atomic_add(gx.t59_diag, 4, 1.0)
+                            wp.atomic_add(gx.t59_diag, 13, d_c52)
+                            wp.atomic_max(gx.t59_diag, 14, d_c52)
+                            wp.atomic_max(gx.t59_diag, 15, -d_c52)
                     best = d_c52
                     w = w_c52
                     nbest = n_c52
@@ -3933,6 +3945,13 @@ def tri_sdf_closest_mesh(
                     if n_t59 > 0:
                         gx.t52_cw[pair] = w_t59
                         gx.t52_cvalid[pair] = 1
+                        if _T59_SEED_CVALID_FIX != 0:
+                            if d_t59 >= bg:
+                                gx.t52_cvalid[pair] = 0
+                                wp.atomic_add(gx.t59_diag, 24, 1.0)
+                        if _T59_ZW_DIAG != 0:
+                            if d_t59 >= bg:
+                                wp.atomic_add(gx.t59_diag, 25, 1.0)
                     else:
                         gx.t52_cvalid[pair] = 0
                 if n_t59 > 0:
@@ -3950,6 +3969,13 @@ def tri_sdf_closest_mesh(
                     if n_s52 > 0:
                         gx.t52_cw[pair] = w_s52
                         gx.t52_cvalid[pair] = 1
+                        if _T59_SEED_CVALID_FIX != 0:
+                            if d_s52 >= bg:
+                                gx.t52_cvalid[pair] = 0
+                                wp.atomic_add(gx.t59_diag, 24, 1.0)
+                        if _T59_ZW_DIAG != 0:
+                            if d_s52 >= bg:
+                                wp.atomic_add(gx.t59_diag, 25, 1.0)
                     else:
                         gx.t52_cvalid[pair] = 0
                 if n_s52 > 0:
@@ -4264,6 +4290,12 @@ def eval_tri_sdf_contact_kernel(
                 hold_p[pair] = (a * w[0] + b * w[1] + c * w[2]) - n_exact * best
             else:
                 hold_valid[pair] = 0
+    if _T59_ZW_DIAG != 0:
+        if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+            if anchor_seed != 0:
+                wp.atomic_add(gx.t59_diag, 11, 1.0)
+            else:
+                wp.atomic_add(gx.t59_diag, 10, 1.0)
     if best >= half_thickness:
         # T8: the pair separated -> drop the anchor.  Seeding/holding is keyed on
         # GEOMETRIC contact (best <= h), not on the force band, so a pair that
@@ -4496,6 +4528,9 @@ def eval_tri_sdf_contact_kernel(
                     + wp.transform_point(X_sw_p, pos[i2]) * aw[2]
                 )
                 if seeded == 0:
+                    if _T59_ZW_DIAG != 0:
+                        if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+                            wp.atomic_add(gx.t59_diag, 20, 1.0)
                     anchor_w[pair] = w
                     seed_p = q_prev_loc
                     if _T18_FIX_TAN != 0:
@@ -4545,6 +4580,9 @@ def eval_tri_sdf_contact_kernel(
                             keep_len = lp - drag
                         keep = wp.transform_vector(X_sw_p, sp_t * (keep_len / lp))
                         anchor_p[pair] = q_prev_loc - keep
+                        if _T59_ZW_DIAG != 0:
+                            if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+                                wp.atomic_add(gx.t59_diag, 20, 1.0)
                 if _T18_FIX_DRAG != 0:
                     anchor_qp[pair] = q_prev_loc
             slip_loc = wp.vec3(0.0, 0.0, 0.0)
@@ -4635,6 +4673,9 @@ def eval_tri_sdf_contact_kernel(
             # T13 逐对向量诊断（纯输出）。f_t_a 已是钳制后的最终切向力，
             # best_seed 用与内核同一个后端查询函数对播种材料点 q_loc 再查一次。
             if dbg_when != 0 and anchor_dbg2.shape[0] > 1:
+                if _T59_ZW_DIAG != 0:
+                    if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+                        wp.atomic_add(gx.t59_diag, 21, 1.0)
                 q_search_w = wp.transform_point(X_ws, a * w[0] + b * w[1] + c * w[2])
                 q_seed_w = wp.transform_point(X_ws, q_loc)
                 best_seed = float(bg)
@@ -4668,6 +4709,9 @@ def eval_tri_sdf_contact_kernel(
                 anchor_dbg2[pair, 18] = float(slot)
                 anchor_dbg2[pair, 19] = cone
             if anchor_tail != 0 and anchor_dbg2.shape[0] > 1:
+                if _T59_ZW_DIAG != 0:
+                    if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+                        wp.atomic_add(gx.t59_diag, 22, 1.0)
                 # T18：同一跑里再记一份「最后一次 Newton 迭代」的切向力与偏移。
                 # 迭代 0 的那一份是试探值（pos 还是 x_prev）；这一份才是这个
                 # substep 真正被施加的力。两份放同一个数组的不同槽位，就能
@@ -4711,6 +4755,9 @@ def eval_tri_sdf_contact_kernel(
             ft_diag = f_t
             cone_diag = mu * f_n
     if fric_diag_accum != 0 and fric_diag.shape[0] > 1:
+        if _T59_ZW_DIAG != 0:
+            if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+                wp.atomic_add(gx.t59_diag, 23, 1.0)
         # T18 P-9 仪器：逐 shape 14 槽
         # 0 Sigma|f_t| | 1 Sigma f_n | 2 受载对数 | 3 Sigma cone | 4 在锥上的对数
         # 5 Sigma|slip_t| | 6 Sigma slip_max | 7-9 Sigma f_t（矢量和，世界系）
@@ -4763,6 +4810,24 @@ def eval_tri_sdf_contact_kernel(
         # 是保 SPD 的标准集总，对角正好复现该模态的真刚度。
         # 只动切向块：法向的 hw 不碰（法向通道实测对此不敏感，N 变化 <1.5%）。
         haw = aw_out
+    if _T59_ZW_DIAG != 0:
+        if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+            fs59 = float(0.0)
+            if w[0] > 0.0:
+                fs59 = fs59 + wp.length(f * w[0])
+            if w[1] > 0.0:
+                fs59 = fs59 + wp.length(f * w[1])
+            if w[2] > 0.0:
+                fs59 = fs59 + wp.length(f * w[2])
+            ft59 = float(0.0)
+            if aw_out[0] > 0.0:
+                ft59 = ft59 + wp.length(f_t_a * aw_out[0])
+            if aw_out[1] > 0.0:
+                ft59 = ft59 + wp.length(f_t_a * aw_out[1])
+            if aw_out[2] > 0.0:
+                ft59 = ft59 + wp.length(f_t_a * aw_out[2])
+            wp.atomic_add(gx.t59_diag, 16, fs59)
+            wp.atomic_add(gx.t59_diag, 17, ft59)
     if aw_out[0] > 0.0:
         wp.atomic_add(forces, i0, f_t_a * aw_out[0])
         wp.atomic_add(hessians, i0, nn_t_a * haw[0])
@@ -4975,6 +5040,9 @@ def accumulate_tri_sdf_reaction_kernel(
             best = sdf_grid_sample(
                 sdf, base, nx, ny, nz, org, inv_voxel, bg, a * w[0] + b * w[1] + c * w[2]
             )
+    if _T59_ZW_DIAG != 0:
+        if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+            wp.atomic_add(gx.t59_diag, 12, 1.0)
     if best >= half_thickness:
         return
 
@@ -5066,6 +5134,10 @@ def accumulate_tri_sdf_reaction_kernel(
             )
             reaction = reaction - f_t
     com = wp.transform_point(body_q[body], body_com[body])
+    if _T59_ZW_DIAG != 0:
+        if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+            wp.atomic_add(gx.t59_diag, 18, wp.length(reaction))
+            wp.atomic_add(gx.t59_diag, 19, wp.length(wp.cross(p_world - com, reaction)))
     wp.atomic_add(body_f, body, wp.spatial_vector(reaction, wp.cross(p_world - com, reaction)))
 
 
