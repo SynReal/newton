@@ -546,6 +546,9 @@ class SdfGridExact:
     # per-slot shape mesh (ray queries from the voxel-path projection kernel)
     t52_mesh: wp.array(dtype=wp.uint64)
     t52_mask: int
+    # v4 per-(slot, tri) seed cache: best seed barycentric w from iteration 0 of the substep
+    t52_cw: wp.array(dtype=wp.vec3)
+    t52_cvalid: wp.array(dtype=wp.int32)
 
 
 @wp.func
@@ -715,9 +718,11 @@ def t52_seeds_exact(
                         okd, inw = t52_inward(gx.t52_n[ebase + idx], e1, e2)
                         if okd != 0:
                             x = a + e1 * u + e2 * v
-                            for j in range(2):
-                                delta = float(5.0e-5)
+                            for j in range(3):
+                                delta = float(1.0e-5)
                                 if j == 1:
+                                    delta = 5.0e-5
+                                if j == 2:
                                     delta = 2.0e-4
                                 pk = x + inw * delta
                                 ins, wk = t52_bary_in(pk, a, e1, e2)
@@ -864,9 +869,11 @@ def t52_seeds_voxel(
                         okd, inw = t52_inward(gx.t52_n[ebase + idx], e1, e2)
                         if okd != 0:
                             x = a + e1 * u + e2 * v
-                            for j in range(2):
-                                delta = float(5.0e-5)
+                            for j in range(3):
+                                delta = float(1.0e-5)
                                 if j == 1:
+                                    delta = 5.0e-5
+                                if j == 2:
                                     delta = 2.0e-4
                                 pk = x + inw * delta
                                 ins, wk = t52_bary_in(pk, a, e1, e2)
@@ -3040,19 +3047,14 @@ def project_tri_sdf_kernel(
         best = dc
         w = wp.vec3(0.0, 0.0, 1.0)
     if _T52_EDGE_SEEDS != 0:
-        # T52: same edge-crossing seed as tri_sdf_closest_mesh, on this kernel's field
-        # same Lipschitz pre-filter; one voxel of slack for the trilinear field
-        reach52 = wp.max(wp.length(a - p), wp.max(wp.length(b - p), wp.length(c - p)))
-        l_a52 = wp.max(wp.length(b - a), wp.length(c - a))
-        l_b52 = wp.max(wp.length(b - a), wp.length(c - b))
-        l_c52 = wp.max(wp.length(c - a), wp.length(c - b))
-        lbound52 = wp.max(dg - reach52, wp.max(da - l_a52, wp.max(db - l_b52, dc - l_c52)))
-        if lbound52 <= half_thickness + voxel or (gx.t52_mask & 32) == 0:
-            n_s52, d_s52, w_s52 = t52_seeds_voxel(a, b, c, gx, slot, sdf, base, nx, ny, nz, org, inv_voxel, bg)
-            if n_s52 > 0:
-                if d_s52 < best:
-                    best = d_s52
-                    w = w_s52
+        # T52 v4: the seed the force kernel stored at iteration 0 of this substep, on this kernel's field
+        if gx.t52_cvalid[tid] != 0:
+            w_c52 = gx.t52_cw[tid]
+            p_c52 = a * w_c52[0] + b * w_c52[1] + c * w_c52[2]
+            d_c52 = sdf_grid_sample(sdf, base, nx, ny, nz, org, inv_voxel, bg, p_c52)
+            if d_c52 < best:
+                best = d_c52
+                w = w_c52
     if best >= bg:
         return
 
@@ -3509,6 +3511,8 @@ def tri_sdf_closest_mesh(
     bg: float,
     cull: float,
     refine_steps: int,
+    pair: int,
+    seed_mode: int,
 ):
     """``tri_sdf_closest`` on the exact field: same search, exact evaluations.
 
@@ -3573,25 +3577,30 @@ def tri_sdf_closest_mesh(
         if _T14_SDF_SKIPREF != 0:
             p_best = c
     if _T52_EDGE_SEEDS != 0:
-        # T52: a closed rigid mesh that pierces the triangle's interior while all
-        # three vertices stay outside must have edges crossing the triangle; the
-        # mean of those crossings sits inside the small SDF<0 island the four
-        # seeds above cannot reach.  Strictly-deeper acceptance, then the same
-        # refinement.
-        # Strict 1-Lipschitz pre-filter (loses no solution): every point x of the
-        # triangle is within ``reach`` of the centroid and within the longest
-        # incident edge of each vertex, so min_tri SDF >= max(SDF(g) - reach,
-        # SDF(v) - l_v).  If that bound already exceeds the shell h the triangle
-        # cannot touch or penetrate and the expensive seeds are skipped.
-        l_a52 = wp.max(wp.length(b - a), wp.length(c - a))
-        l_b52 = wp.max(wp.length(b - a), wp.length(c - b))
-        l_c52 = wp.max(wp.length(c - a), wp.length(c - b))
-        lbound52 = wp.max(dg - reach, wp.max(da - l_a52, wp.max(db - l_b52, dc - l_c52)))
-        if lbound52 > cull and (gx.t52_mask & 32) != 0:
-            wp.atomic_add(gx.t52_diag, 4, 1.0)
+        # T52: rigid-feature seeds (categories in gx.t52_mask).  seed_mode 0 = compute every call;
+        # 1 = compute and store the best seed w for this (slot, tri) -- iteration 0 of the substep;
+        # 2 = read the stored seed and evaluate the field there once (iterations 1..19, reaction).
+        # Strictly-deeper acceptance, then the same refinement.
+        if seed_mode == 2:
+            if gx.t52_cvalid[pair] != 0:
+                w_c52 = gx.t52_cw[pair]
+                p_c52 = a * w_c52[0] + b * w_c52[1] + c * w_c52[2]
+                d_c52, n_c52 = sdf_query(mesh, gx, slot, rq, bg, p_c52)
+                if d_c52 < best - tol:
+                    wp.atomic_add(gx.t52_diag, 2, 1.0)
+                    best = d_c52
+                    w = w_c52
+                    nbest = n_c52
+                    if _T14_SDF_SKIPREF != 0:
+                        p_best = p_c52
         else:
-            wp.atomic_add(gx.t52_diag, 5, 1.0)
             n_s52, d_s52, w_s52, nn_s52 = t52_seeds_exact(a, b, c, mesh, gx, slot, rq, bg)
+            if seed_mode == 1:
+                if n_s52 > 0:
+                    gx.t52_cw[pair] = w_s52
+                    gx.t52_cvalid[pair] = 1
+                else:
+                    gx.t52_cvalid[pair] = 0
             if n_s52 > 0:
                 wp.atomic_add(gx.t52_diag, 1, 1.0)
                 if d_s52 < best - tol:
@@ -3821,7 +3830,7 @@ def eval_tri_sdf_contact_kernel(
         if _T14_SDF_HOLD_DIAG != 0:
             # what the un-held code would have said at this same iterate
             w_t, best_t, n_t = tri_sdf_closest_mesh(
-                a, b, c, sdf_mesh[slot], gx, slot, bg, half_thickness, refine_steps
+                a, b, c, sdf_mesh[slot], gx, slot, bg, half_thickness, refine_steps, pair, 0
             )
             if best_t < bg:
                 d = wp.abs(best - best_t)
@@ -3867,7 +3876,7 @@ def eval_tri_sdf_contact_kernel(
     elif _R16_SDF_EXACT != 0:
         # R16-A2': same search, exact field.  The freeze switch is a grid-path
         # remedy for the winner-take-all redraw and is not combined with it.
-        w, best, n_exact = tri_sdf_closest_mesh(a, b, c, sdf_mesh[slot], gx, slot, bg, half_thickness, refine_steps)
+        w, best, n_exact = tri_sdf_closest_mesh(a, b, c, sdf_mesh[slot], gx, slot, bg, half_thickness, refine_steps, pair, wp.where(anchor_seed != 0, 1, 2))
     elif _R13G_SDF_FREEZE == 0:
         w, best = tri_sdf_closest(
                 a, b, c, sdf, base, nx, ny, nz, org, inv_voxel, voxel, bg, refine_steps,
@@ -4589,7 +4598,7 @@ def accumulate_tri_sdf_reaction_kernel(
     elif _R16_SDF_EXACT != 0:
         # R16-A2': identical query to the force pass, so the two halves of the
         # contact cannot disagree about where or how deep it is.
-        w, best, n_exact = tri_sdf_closest_mesh(a, b, c, sdf_mesh[slot], gx, slot, bg, half_thickness, refine_steps)
+        w, best, n_exact = tri_sdf_closest_mesh(a, b, c, sdf_mesh[slot], gx, slot, bg, half_thickness, refine_steps, pair, 2)
     elif _R13G_SDF_FREEZE == 0:
         w, best = tri_sdf_closest(
                 a, b, c, sdf, base, nx, ny, nz, org, inv_voxel, voxel, bg, refine_steps,

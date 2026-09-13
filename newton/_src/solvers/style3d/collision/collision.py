@@ -1744,7 +1744,7 @@ class Collision:
             + _tolnote
         )
 
-    def _t52_build_edge_seeds(self, device, verts_list, inds_list, meshes=None):
+    def _t52_build_edge_seeds(self, device, verts_list, inds_list, meshes=None, n_pairs=1):
         """T52 v3: bake rigid-mesh feature tables into ``self.tri_sdf_gx``.
 
         ``T52_TRI_SDF_EDGE_SEEDS`` (int): 0 = off (length-1 dummies, nothing read).
@@ -1774,6 +1774,10 @@ class Collision:
         mask = mode & 39
         all_edges = bool(mode & 8)
         gx.t52_mask = int(mask)
+        # v4 seed cache, one entry per (slot, tri) pair (length 1 when off)
+        _np52 = max(int(n_pairs), 1) if mode != 0 else 1
+        gx.t52_cw = wp.zeros(_np52, dtype=wp.vec3, device=device)
+        gx.t52_cvalid = wp.zeros(_np52, dtype=wp.int32, device=device)
         if mode == 0 or not verts_list:
             gx.t52_p0 = wp.zeros(1, dtype=wp.vec3, device=device)
             gx.t52_p1 = wp.zeros(1, dtype=wp.vec3, device=device)
@@ -1894,7 +1898,7 @@ class Collision:
         print(
             f"[T52] edge_seeds={mode} baked_const={int(_T52_EDGE_SEEDS_BAKED)} mask={mask} cats={cats} "
             f"meshes={len(ecounts)} edges={ecounts} ({'all' if all_edges else 'convex sharp > 30 deg + boundary'}) "
-            f"convex_verts={vcounts} visit_cap={65536} eval_cap=16 (overflow counts in read_t52_diag [0],[3]) "
+            f"convex_verts={vcounts} seed_cache_pairs={_np52} (iter0 compute+store, iters>=1/reaction/projection read) visit_cap={65536} eval_cap=16 (overflow counts in read_t52_diag [0],[3]) "
             f"kernels_enable_backward={bool(wp.get_module_options(_t52_kernels_module).get('enable_backward', True))}",
             flush=True,
         )
@@ -2456,7 +2460,7 @@ class Collision:
             device, gx_verts, gx_inds, meshes, float(pad), float(bake_max_dist), float(voxel)
         )
         # T52: edge-crossing seed tables (dummies when off; always after the gx build)
-        self._t52_build_edge_seeds(device, gx_verts, gx_inds, meshes)
+        self._t52_build_edge_seeds(device, gx_verts, gx_inds, meshes, len(slots) * int(self.model.tri_count))
         _exact = int(__import__("os").environ.get("R16_SDF_EXACT", "0"))
         print(
             "[collision] tri-SDF query backend = "
