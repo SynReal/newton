@@ -40,13 +40,24 @@ from newton._src.solvers.style3d.collision.kernels import (
     tri_sdf_par_cull_kernel,
     tri_sdf_par_seed_kernel,
     SdfGridExact,
+    t59_seed_gather_kernel,
+    t59_probe_eval_kernel,
+    t59_seed_reduce_kernel,
 )
 # T18 自证串用：读**内核里真正烘进 wp.constant 的那个值**，不是再读一次 os.environ
 # （环境在 import newton 之后改掉的话两者会不一致，自证串必须报前者）。
 from newton._src.solvers.style3d.collision.kernels import (  # noqa: E402
     _T18_FIX_RAW as _T18_FIX_RAW_BAKED,
+    _T52_EDGE_SEEDS as _T52_EDGE_SEEDS_BAKED,
+    _T59_SEED_PASS as _T59_SEED_PASS_BAKED,
+    _T59_SEED_K as _T59_SEED_K_BAKED,
 )
+from newton._src.solvers.style3d.collision import kernels as _t52_kernels_module  # noqa: E402
 from newton._src.solvers.style3d.collision import _t14_prof
+from newton._src.solvers.style3d.collision.t44b_kernels import (  # noqa: E402
+    t44b_accumulate_sweep_displacement_kernel,
+    t44b_remove_projection_velocity_kernel,
+)
 
 
 def _t14_bake_dir():
@@ -389,6 +400,18 @@ class Collision:
         # E3 triangle-level SDF contact. ``None`` = disabled; nothing is
         # allocated and no kernel is launched, so the default path is unchanged.
         self.tri_sdf_slot_shape = None
+        # T41: 三角形级位置投影（默认关）。开时 project_contacts_iteration 里的
+        # _tri_sdf_sweep 也在 compliant（力核）模式下运行，即「min_{x in tri} SDF >= h」
+        # 同时当位置约束和罚力用；反作用改读投影前的位置快照，否则压深被自己清成 0。
+        # OFF（默认）时下面每一处新增分支都取 False，代码路径与开关引入前逐位相同。
+        self.tri_sdf_projection = False
+        self.tri_sdf_pre_q = None
+        # T42-B: 力核（eval_tri_sdf_contact_kernel）的压深也读投影前快照，与
+        # accumulate_tri_sdf_reaction 同一口径。默认关。
+        self.tri_sdf_force_pre_q = False
+        # T44b（默认关）：三角形级投影的位移不进粒子速度。只在 tri_sdf_projection 开时生效。
+        self.tri_sdf_proj_nokick = False
+        self.t44b_step_disp = None
         self.tri_sdf_compliant = False
         # R16-A2': the shape meshes the exact query backend evaluates against.
         self.tri_sdf_meshes = None
@@ -1438,15 +1461,27 @@ class Collision:
                     # built here is valid for every consumer of this substep --
                     # including the reaction pass, which runs after the solve.
                     self._t14_broadphase(state_out.particle_q, _tri_sdf_body_q, _n_pairs)
+                if _iter == 0 and _hold_mode != 2 and getattr(self, "t59_seed_pass", False):
+                    # T59: seed pass for this substep, on exactly the force kernel's inputs.
+                    _t59_q = state_out.particle_q
+                    if self.tri_sdf_force_pre_q and self.tri_sdf_pre_q is not None:
+                        _t59_q = self.tri_sdf_pre_q
+                    self._t59_seed_pass(_t59_q, _tri_sdf_body_q, _n_pairs)
                 for _bp_dim, _bp_mode in self._t14_launch_plan(_n_pairs):
                     with _t14_prof.section("tri_sdf_force"
                                           if _hold_mode != 2
                                           else "tri_sdf_force_held"):
+                        # T42-B: the FORCE reads the pre-projection snapshot, same
+                        # way the reaction does. Candidates / broad-phase stay on the
+                        # current positions; only the depth the penalty sees changes.
+                        _t42_force_q = state_out.particle_q
+                        if self.tri_sdf_force_pre_q and self.tri_sdf_pre_q is not None:
+                            _t42_force_q = self.tri_sdf_pre_q
                         wp.launch(
                             eval_tri_sdf_contact_kernel,
                             dim=_bp_dim,
                             inputs=[
-                                state_out.particle_q,
+                                _t42_force_q,
                                 self.model.tri_indices,
                                 int(self.model.tri_count),
                                 self.tri_sdf_stiffness,
@@ -1720,6 +1755,251 @@ class Collision:
             + _tolnote
         )
 
+    def _t52_build_edge_seeds(self, device, verts_list, inds_list, meshes=None, n_pairs=1):
+        """T52 v3: bake rigid-mesh feature tables into ``self.tri_sdf_gx``.
+
+        ``T52_TRI_SDF_EDGE_SEEDS`` (int): 0 = off (length-1 dummies, nothing read).
+        Otherwise low 3 bits = category mask (1 = cloth-edge x mesh rays, 2 = mesh
+        edges x triangle, 4 = convex sharp vertices -> plane); +8 = category 2 uses
+        EVERY edge instead of convex sharp (> 30 deg) + boundary edges; 16 alone =
+        tables built with mask 0 (ablation baseline).  Vertices are welded first;
+        meshes with identical geometry share tables and BVHs.
+        """
+        import hashlib
+        import os
+
+        mode = int(os.environ.get("T52_TRI_SDF_EDGE_SEEDS", "0") or 0)
+        gx = self.tri_sdf_gx
+        # [0] edge-visit overflows [1] triangles probed [2] seeds accepted [3] vertex-visit overflows
+        # [4] Lipschitz pre-filter skipped [5] pre-filter passed (expensive seeds run)
+        gx.t52_diag = wp.zeros(6, dtype=float, device=device)
+        nslot = max(len(verts_list), 1)
+        if int(_T52_EDGE_SEEDS_BAKED) != (1 if mode != 0 else 0):
+            raise RuntimeError(
+                f"[T52] T52_TRI_SDF_EDGE_SEEDS={mode} but kernels baked _T52_EDGE_SEEDS="
+                f"{int(_T52_EDGE_SEEDS_BAKED)} (environment changed after import?)"
+            )
+        self.t52_mode = mode
+        self.t52_bvhs = []
+        # bit 32 = strict 1-Lipschitz pre-filter before the expensive seeds (runtime, same build)
+        mask = mode & 39
+        all_edges = bool(mode & 8)
+        gx.t52_mask = int(mask)
+        # v4 seed cache, one entry per (slot, tri) pair (length 1 when off)
+        _np52 = max(int(n_pairs), 1) if mode != 0 else 1
+        gx.t52_cw = wp.zeros(_np52, dtype=wp.vec3, device=device)
+        gx.t52_cvalid = wp.zeros(_np52, dtype=wp.int32, device=device)
+        # T59 seed pass buffers (length-1 dummies unless the pass is baked on)
+        _t59_on = int(_T59_SEED_PASS_BAKED) != 0 and mode != 0 and bool(verts_list)
+        _t59_req = int(os.environ.get("T59_SEED_PASS", "0") or 0)
+        _k59 = int(_T59_SEED_K_BAKED)
+        _cap59 = max(1, int(os.environ.get("T59_SEED_CAP", "4096") or 4096)) if _t59_on else 1
+        _np59 = _np52 if _t59_on else 1
+        gx.t59_pairk = wp.full(_np59, -1, dtype=wp.int32, device=device)
+        gx.t59_kpair = wp.full(_cap59, -1, dtype=wp.int32, device=device)
+        gx.t59_np = wp.zeros(_cap59, dtype=wp.int32, device=device)
+        gx.t59_rq = wp.zeros(_cap59, dtype=float, device=device)
+        gx.t59_pk = wp.zeros(_cap59 * _k59 if _t59_on else 1, dtype=wp.vec3, device=device)
+        gx.t59_pw = wp.zeros(_cap59 * _k59 if _t59_on else 1, dtype=wp.vec3, device=device)
+        gx.t59_pd = wp.zeros(_cap59 * _k59 if _t59_on else 1, dtype=float, device=device)
+        gx.t59_pn = wp.zeros(_cap59 * _k59 if _t59_on else 1, dtype=wp.vec3, device=device)
+        gx.t59_count = wp.zeros(1, dtype=wp.int32, device=device)
+        gx.t59_cap = int(_cap59)
+        gx.t59_rn = wp.zeros(_np59, dtype=wp.int32, device=device)
+        gx.t59_rd = wp.zeros(_np59, dtype=float, device=device)
+        gx.t59_rw = wp.zeros(_np59, dtype=wp.vec3, device=device)
+        gx.t59_rnn = wp.zeros(_np59, dtype=wp.vec3, device=device)
+        # [0..2] seed pass, [3..9] zero-weight diagnostic (T59_ZW_DIAG), see kernels.py
+        gx.t59_diag = wp.zeros(26, dtype=float, device=device)
+        self.t59_seed_pass = bool(_t59_on)
+        if _t59_req != 0 and not _t59_on:
+            print(f"[T59] seed_pass requested={_t59_req} but INACTIVE (baked={int(_T59_SEED_PASS_BAKED)} t52_mode={mode})", flush=True)
+        print(
+            f"[T59] seed_pass={int(_t59_on)} baked={int(_T59_SEED_PASS_BAKED)} cap={_cap59} K={_k59} "
+            f"pairs={_np59} (iter0: K1 gather n_pairs, K2 probe eval cap*K, K3 reduce cap; force kernel reads per-pair result)",
+            flush=True,
+        )
+        if mode == 0 or not verts_list:
+            gx.t52_p0 = wp.zeros(1, dtype=wp.vec3, device=device)
+            gx.t52_p1 = wp.zeros(1, dtype=wp.vec3, device=device)
+            gx.t52_n = wp.zeros(1, dtype=wp.vec3, device=device)
+            gx.t52_ebase = wp.zeros(nslot, dtype=wp.int32, device=device)
+            gx.t52_bvh = wp.zeros(nslot, dtype=wp.uint64, device=device)
+            gx.t52_vp = wp.zeros(1, dtype=wp.vec3, device=device)
+            gx.t52_vn = wp.zeros(1, dtype=wp.vec3, device=device)
+            gx.t52_vbase = wp.zeros(nslot, dtype=wp.int32, device=device)
+            gx.t52_vbvh = wp.zeros(nslot, dtype=wp.uint64, device=device)
+            gx.t52_mesh = wp.zeros(nslot, dtype=wp.uint64, device=device)
+            gx.t52_mask = 0
+            print(f"[T52] edge_seeds=0 baked_const={int(_T52_EDGE_SEEDS_BAKED)} (off)", flush=True)
+            return
+        if meshes is None or len(meshes) != len(verts_list):
+            raise RuntimeError("[T52] shape meshes are required when T52 is on")
+        cos_sharp = float(np.cos(np.deg2rad(30.0)))
+        p0_b, p1_b, n_b, vp_b, vn_b = [], [], [], [], []
+        ebase, vbase, bvh_ids, vbvh_ids, mesh_ids, seen = [], [], [], [], [], {}
+        ecounts, vcounts = [], []
+        etot = vtot = 0
+
+        def _bvh(lo, hi):
+            bvh = wp.Bvh(wp.array(lo, dtype=wp.vec3, device=device), wp.array(hi, dtype=wp.vec3, device=device))
+            self.t52_bvhs.append(bvh)
+            return int(bvh.id)
+
+        for vertices, indices, mesh in zip(verts_list, inds_list, meshes):
+            V = np.asarray(vertices, dtype=np.float64).reshape(-1, 3)
+            F = np.asarray(indices, dtype=np.int64).reshape(-1, 3)
+            key = (
+                hashlib.sha1(np.ascontiguousarray(V).tobytes()).hexdigest(),
+                hashlib.sha1(np.ascontiguousarray(F).tobytes()).hexdigest(),
+            )
+            if key not in seen:
+                q = np.round(V / 1.0e-9).astype(np.int64)
+                uq, inv = np.unique(q, axis=0, return_inverse=True)
+                inv = np.asarray(inv).reshape(-1)
+                Vw = np.zeros((len(uq), 3), dtype=np.float64)
+                np.add.at(Vw, inv, V)
+                Vw /= np.bincount(inv, minlength=len(uq))[:, None]
+                Fw = inv[F]
+                keep = (Fw[:, 0] != Fw[:, 1]) & (Fw[:, 1] != Fw[:, 2]) & (Fw[:, 0] != Fw[:, 2])
+                Fw = Fw[keep]
+                fnr = np.cross(Vw[Fw[:, 1]] - Vw[Fw[:, 0]], Vw[Fw[:, 2]] - Vw[Fw[:, 0]])
+                fn = fnr / np.maximum(np.linalg.norm(fnr, axis=1, keepdims=True), 1.0e-30)
+                E = np.concatenate([Fw[:, [0, 1]], Fw[:, [1, 2]], Fw[:, [2, 0]]])
+                opp = np.concatenate([Fw[:, 2], Fw[:, 0], Fw[:, 1]])
+                fid = np.tile(np.arange(len(Fw)), 3)
+                Es = np.sort(E, axis=1)
+                order = np.lexsort((Es[:, 1], Es[:, 0]))
+                Es, opp, fid = Es[order], opp[order], fid[order]
+                newg = np.ones(len(Es), dtype=bool)
+                newg[1:] = np.any(Es[1:] != Es[:-1], axis=1)
+                first = np.nonzero(newg)[0]
+                gid = np.cumsum(newg) - 1
+                cnt = np.bincount(gid, minlength=len(first))
+                ue = Es[first]
+                en = np.zeros((len(first), 3), dtype=np.float64)
+                np.add.at(en, gid, fn[fid])
+                en /= np.maximum(np.linalg.norm(en, axis=1, keepdims=True), 1.0e-30)
+                sharp = cnt != 2  # boundary / non-manifold edges count as sharp
+                two = np.nonzero(cnt == 2)[0]
+                i0 = first[two]
+                i1 = i0 + 1
+                n0 = fn[fid[i0]]
+                n1 = fn[fid[i1]]
+                cosang = np.einsum("ij,ij->i", n0, n1)
+                convex = np.einsum("ij,ij->i", Vw[opp[i1]] - Vw[ue[two, 0]], n0) < 0.0
+                sharp[two] = (cosang < cos_sharp) & convex
+                esel = np.ones(len(ue), dtype=bool) if all_edges else sharp
+                P0 = Vw[ue[esel, 0]].astype(np.float32)
+                P1 = Vw[ue[esel, 1]].astype(np.float32)
+                EN = en[esel].astype(np.float32)
+                # convex sharp vertices + angle-weighted vertex pseudo-normals
+                vsel = np.unique(ue[sharp].reshape(-1))
+                vnrm = np.zeros_like(Vw)
+                for k in range(3):
+                    o = Vw[Fw[:, k]]
+                    x1 = Vw[Fw[:, (k + 1) % 3]] - o
+                    x2 = Vw[Fw[:, (k + 2) % 3]] - o
+                    x1 /= np.maximum(np.linalg.norm(x1, axis=1, keepdims=True), 1.0e-30)
+                    x2 /= np.maximum(np.linalg.norm(x2, axis=1, keepdims=True), 1.0e-30)
+                    ang = np.arccos(np.clip((x1 * x2).sum(1), -1.0, 1.0))
+                    np.add.at(vnrm, Fw[:, k], fn * ang[:, None])
+                vnrm /= np.maximum(np.linalg.norm(vnrm, axis=1, keepdims=True), 1.0e-30)
+                VP = Vw[vsel].astype(np.float32)
+                VN = vnrm[vsel].astype(np.float32)
+                ebid = _bvh(np.minimum(P0, P1) - 1.0e-6, np.maximum(P0, P1) + 1.0e-6)
+                vbid = _bvh(VP - 1.0e-6, VP + 1.0e-6)
+                seen[key] = (etot, ebid, vtot, vbid)
+                p0_b.append(P0)
+                p1_b.append(P1)
+                n_b.append(EN)
+                vp_b.append(VP)
+                vn_b.append(VN)
+                ecounts.append(len(P0))
+                vcounts.append(len(VP))
+                etot += len(P0)
+                vtot += len(VP)
+            eb, ebid, vb, vbid = seen[key]
+            ebase.append(eb)
+            bvh_ids.append(ebid)
+            vbase.append(vb)
+            vbvh_ids.append(vbid)
+            mesh_ids.append(int(mesh.id))
+        gx.t52_p0 = wp.array(np.concatenate(p0_b), dtype=wp.vec3, device=device)
+        gx.t52_p1 = wp.array(np.concatenate(p1_b), dtype=wp.vec3, device=device)
+        gx.t52_n = wp.array(np.concatenate(n_b), dtype=wp.vec3, device=device)
+        gx.t52_ebase = wp.array(np.asarray(ebase, dtype=np.int32), dtype=wp.int32, device=device)
+        gx.t52_bvh = wp.array(np.asarray(bvh_ids, dtype=np.uint64), dtype=wp.uint64, device=device)
+        gx.t52_vp = wp.array(np.concatenate(vp_b), dtype=wp.vec3, device=device)
+        gx.t52_vn = wp.array(np.concatenate(vn_b), dtype=wp.vec3, device=device)
+        gx.t52_vbase = wp.array(np.asarray(vbase, dtype=np.int32), dtype=wp.int32, device=device)
+        gx.t52_vbvh = wp.array(np.asarray(vbvh_ids, dtype=np.uint64), dtype=wp.uint64, device=device)
+        gx.t52_mesh = wp.array(np.asarray(mesh_ids, dtype=np.uint64), dtype=wp.uint64, device=device)
+        cats = "+".join(n for bit, n in ((1, "b:tri-edge-rays"), (2, "c:mesh-edges"), (4, "d:convex-verts")) if mask & bit) or "none"
+        print(
+            f"[T52] edge_seeds={mode} baked_const={int(_T52_EDGE_SEEDS_BAKED)} mask={mask} cats={cats} "
+            f"meshes={len(ecounts)} edges={ecounts} ({'all' if all_edges else 'convex sharp > 30 deg + boundary'}) "
+            f"convex_verts={vcounts} seed_cache_pairs={_np52} (iter0 compute+store, iters>=1/reaction/projection read) visit_cap={65536} eval_cap=16 (overflow counts in read_t52_diag [0],[3]) "
+            f"kernels_enable_backward={bool(wp.get_module_options(_t52_kernels_module).get('enable_backward', True))}",
+            flush=True,
+        )
+
+    def _t59_seed_pass(self, particle_q, body_q, n_pairs: int):
+        """T59: gather / evaluate / reduce the F2 seeds before iteration 0's force kernel.
+
+        Fixed launch dims (n_pairs, cap*K, cap) and a device-side counter, so the
+        substep stays CUDA-graph capturable."""
+        gx = self.tri_sdf_gx
+        gx.t59_count.zero_()
+        with _t14_prof.section("t59_seed_gather"):
+            wp.launch(
+                t59_seed_gather_kernel,
+                dim=n_pairs,
+                inputs=[
+                    particle_q,
+                    self.model.tri_indices,
+                    int(self.model.tri_count),
+                    self.tri_sdf_slot_shape,
+                    self.model.shape_body,
+                    self.model.shape_transform,
+                    body_q,
+                    self.tri_sdf_mesh_id,
+                    gx,
+                    self.tri_sdf_bg,
+                    self.tri_sdf_h,
+                ],
+                device=self.model.device,
+            )
+        with _t14_prof.section("t59_probe_eval"):
+            wp.launch(
+                t59_probe_eval_kernel,
+                dim=int(gx.t59_cap) * int(_T59_SEED_K_BAKED),
+                inputs=[int(self.model.tri_count), self.tri_sdf_mesh_id, gx, self.tri_sdf_bg],
+                device=self.model.device,
+            )
+        # T59 v2: no separate reduce launch -- iteration 0's force kernel reduces the
+        # probes in place (t59_seed_reduce_kernel is kept only as the v1 reference).
+
+    def read_t59_diag(self, reset: bool = False):
+        """T59 diagnostic: [gathered, computed serially in K1, force kernel found pairk == -1]."""
+        gx = getattr(self, "tri_sdf_gx", None)
+        if gx is None or getattr(gx, "t59_diag", None) is None:
+            return None
+        v = gx.t59_diag.numpy().copy()
+        if reset:
+            gx.t59_diag.zero_()
+        return v
+
+    def read_t52_diag(self, reset: bool = False):
+        """T52 diagnostic: [edge-visit overflows, triangles probed, seeds accepted, vertex-visit overflows]."""
+        gx = getattr(self, "tri_sdf_gx", None)
+        if gx is None or getattr(gx, "t52_diag", None) is None:
+            return None
+        v = gx.t52_diag.numpy().copy()
+        if reset:
+            gx.t52_diag.zero_()
+        return v
+
     def read_w_diag(self, reset: bool = True):
         """T16 diagnostic accumulator as a dict; optionally zero it.
 
@@ -1758,6 +2038,11 @@ class Collision:
         """
         if self.tri_sdf_slot_shape is None or not self.tri_sdf_compliant:
             return
+        # T41: with the triangle constraint ALSO solved as a position projection,
+        # `particle_q` as handed in has already had the overlap taken out of it,
+        # so k_tri * depth would read ~0. Read the pre-sweep snapshot instead.
+        if self.tri_sdf_projection and self.tri_sdf_pre_q is not None:
+            particle_q = self.tri_sdf_pre_q
         if self.tri_sdf_par and not self.tri_sdf_hold:
             self._t14_par_search(
                 particle_q, body_q, self.tri_sdf_slots * int(self.model.tri_count)
@@ -2261,6 +2546,8 @@ class Collision:
         _gx_note = self._t15_build_gridexact(
             device, gx_verts, gx_inds, meshes, float(pad), float(bake_max_dist), float(voxel)
         )
+        # T52: edge-crossing seed tables (dummies when off; always after the gx build)
+        self._t52_build_edge_seeds(device, gx_verts, gx_inds, meshes, len(slots) * int(self.model.tri_count))
         _exact = int(__import__("os").environ.get("R16_SDF_EXACT", "0"))
         print(
             "[collision] tri-SDF query backend = "
@@ -2584,9 +2871,56 @@ class Collision:
             f"max_corr={max_correction * 1000:g} mm",
             flush=True,
         )
+        # T41 开关：三角形级位置投影。与 fork 里 T15/T18/T31/T34/T36 同一套传统
+        # （import 时不生效、只在 enable 时读一次环境变量），所以 synreal 侧一行不用改。
+        # 不设 / 设 0 ⇒ self.tri_sdf_projection 保持 False ⇒ 下面三处分支全不进，
+        # OFF 路径与本开关引入前逐位相同（无新增 kernel launch、无新增分配）。
+        import os as _os
+
+        self.tri_sdf_projection = bool(int(_os.environ.get("T41_TRI_SDF_PROJECTION", "0")))
+        # T42-B（默认关）：力核也读投影前快照。只有在投影本身开着时才有意义。
+        self.tri_sdf_force_pre_q = bool(int(_os.environ.get("T42_TRI_FORCE_PRE_Q", "0")))
+        if self.tri_sdf_projection:
+            # 初值 = 当前位置，不是 0：力核可能在第一次 sweep 之前就读它。
+            self.tri_sdf_pre_q = wp.clone(self.model.particle_q)
+        # T44b（默认关）：投影位移不进速度。环境变量不设 / 设 0 ⇒ 保持 False ⇒
+        # _tri_sdf_sweep 与 frame_end 里的新分支都不进、不分配 ⇒ 与 d5e550ec 逐位相同。
+        _t44b_req = bool(int(_os.environ.get("T44B_TRI_PROJ_NOKICK", "0")))
+        self.tri_sdf_proj_nokick = _t44b_req and self.tri_sdf_projection
+        if self.tri_sdf_proj_nokick:
+            self.t44b_step_disp = wp.zeros(
+                self.model.particle_count, dtype=wp.vec3, device=self.model.device
+            )
+        _t42_deep = float(_os.environ.get("T42_TRI_DEEP_ONLY_MM", "0"))
+        print(
+            f"[T42] tri_deep_only_mm={_t42_deep:g} force_pre_q={int(self.tri_sdf_force_pre_q)}"
+            + ("  (两段式：浅于阈值不动、深于阈值拉回到 SDF = -d_deep)" if _t42_deep > 0 else "")
+            + ("  (力核压深读投影前快照)" if self.tri_sdf_force_pre_q else ""),
+            flush=True,
+        )
+        print(
+            f"[T41] tri_sdf_projection={int(self.tri_sdf_projection)} "
+            f"(compliant={int(bool(self.tri_sdf_compliant))}, "
+            f"h={half_thickness * 1000:g} mm, max_corr={max_correction * 1000:g} mm, "
+            f"reaction reads {'PRE-projection snapshot' if self.tri_sdf_projection else 'particle_q as given'})",
+            flush=True,
+        )
+        print(
+            f"[T44b] tri_proj_nokick={int(self.tri_sdf_proj_nokick)} (requested={int(_t44b_req)}"
+            + (", IGNORED: tri_sdf_projection is off" if _t44b_req and not self.tri_sdf_projection else "")
+            + (", projection displacement removed from particle_qd at frame_end" if self.tri_sdf_proj_nokick else "")
+            + ")",
+            flush=True,
+        )
 
     def _tri_sdf_sweep(self, particle_q: wp.array[wp.vec3], body_q: wp.array[wp.transform]):
         """One Jacobi sweep of the triangle-level SDF constraint."""
+        # T41: snapshot BEFORE this sweep moves anything. With the constraint run
+        # as a position projection, the overlap the compliant penalty needs is
+        # exactly what the sweep removes, so the reaction has to be read here
+        # instead (same argument as ``contact_projection_reaction_pre``).
+        if self.tri_sdf_projection and self.tri_sdf_pre_q is not None:
+            self.tri_sdf_pre_q.assign(particle_q)
         wp.launch(
             project_tri_sdf_kernel,
             dim=self.tri_sdf_slots * self.model.tri_count,
@@ -2609,6 +2943,7 @@ class Collision:
                 self.tri_sdf_h,
                 self.tri_sdf_max_correction,
                 self.tri_sdf_refine,
+                self.tri_sdf_gx,
             ],
             outputs=[self.proj_delta, self.proj_weight],
             device=self.model.device,
@@ -2620,6 +2955,15 @@ class Collision:
             outputs=[self.proj_delta, self.proj_weight, particle_q, self.proj_accum],
             device=self.model.device,
         )
+        if self.tri_sdf_proj_nokick:
+            # T44b：本次 sweep 实际搬动的位移 = 搬后 − sweep 开头的快照（上面 assign 过）。
+            wp.launch(
+                t44b_accumulate_sweep_displacement_kernel,
+                dim=self.model.particle_count,
+                inputs=[self.tri_sdf_pre_q, particle_q],
+                outputs=[self.t44b_step_disp],
+                device=self.model.device,
+            )
 
     def set_projection_shapes(self, shape_indices) -> None:
         """Restrict the position projection to the given shapes.
@@ -2727,7 +3071,12 @@ class Collision:
         # E3 triangle-level SDF constraint: an independent switch, so it can run
         # on the simplified stack (position projection off, E0c) without
         # dragging the particle-radius projection back in.
-        if self.tri_sdf_slot_shape is not None and not self.tri_sdf_compliant:
+        # T41: `or self.tri_sdf_projection` —— compliant 模式下也跑三角形级位置 sweep。
+        # OFF 时 (not True or False) == (not True)，逐位等价；非 compliant 时
+        # (True or X) == True，也逐位等价。
+        if self.tri_sdf_slot_shape is not None and (
+            not self.tri_sdf_compliant or self.tri_sdf_projection
+        ):
             # compliant mode carries the constraint as a force instead (see
             # accumulate_contact_force), so there is no position sweep here.
             self._tri_sdf_sweep(particle_q, body_q)
@@ -2947,3 +3296,12 @@ class Collision:
 
     def frame_end(self, pos: wp.array[wp.vec3], vel: wp.array[wp.vec3], dt: float):
         """Apply post-processing"""
+        if self.tri_sdf_proj_nokick and self.t44b_step_disp is not None:
+            # T44b：update_velocity 刚算完 vel = 0.998*(x - x_prev)/dt，其中含本步所有
+            # 三角形投影 sweep 的位移；按同一系数扣掉并清零累加器 ⇒ 投影只改位置。
+            wp.launch(
+                t44b_remove_projection_velocity_kernel,
+                dim=self.model.particle_count,
+                inputs=[0.998 / dt, self.t44b_step_disp, vel],
+                device=self.model.device,
+            )

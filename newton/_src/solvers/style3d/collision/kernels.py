@@ -322,6 +322,83 @@ _T15_SDF_GX_RING = wp.constant(int(__import__("os").environ.get("T15_SDF_GX_RING
 # 0 = OFF: the strict ``<`` this file always used, bit-identical.
 _T16_SDF_ARGMIN_TOL = wp.constant(float(__import__("os").environ.get("T16_SDF_ARGMIN_TOL", "0")))
 
+# T42-A 两段式三角形级投影（默认 0 = OFF，codegen 级逐位：常量为 0 时下面每个
+# `if _T42_TRI_DEEP_ONLY > 0.0` 都被折叠掉，生成的 PTX 与本开关引入前相同）。
+#
+# T41b 实测：三角形级位置投影（`tri_sdf_projection`）把「min_{x in tri} SDF >= h」
+# 当**位置约束**解，于是常规夹持压深（0.5-1.3 mm）也被投影推到壳外，力核下一次迭代
+# 读到的压深 -> 0，摩擦 mu*N 与 T8 锚一起 -> 0，抬臂 25-50 mm 布就从钳口滑出
+# （末帧钳口 4/4 = 0 mm²）。
+#
+# 两段式把投影降级成**只在主力层漏了才干活的保险**：
+#   浅于阈值（三角形最深点 SDF >= -d_deep）—— 一律不动，力核一字不改；
+#   深于阈值 —— 把该三角形沿最深点的 SDF 梯度拉回到 SDF = **-d_deep**（不是拉到壳外），
+#               所以残余压深恒为 d_deep，力核照常在这个压深上出法向力与摩擦。
+# d_deep 单位 mm，本批取 0.5 mm（= 壳厚 h），即「真穿过刀面 0.5 mm 以上才动」。
+_T42_TRI_DEEP_ONLY = wp.constant(float(__import__("os").environ.get("T42_TRI_DEEP_ONLY_MM", "0")) * 1.0e-3)
+
+# T52（默认 0 = OFF，codegen 级逐位：常量为 0 时下面每个 `if _T52_EDGE_SEEDS != 0`
+# 都被折叠掉）：tri-SDF 最近点搜索加「刚体网格棱穿三角」种子。
+#
+# T51 实测：刀的凸锐角/棱从布三角**内部**穿出、三角三个顶点都在刀外时，三角面上
+# SDF < 0 的区域是一个中位只占三角面积 1.4 %、直径 1.45 mm 的孤岛，紧贴锐棱；
+# 质心 + 3 顶点种子 + 3 步固定步长下降（7 次采样）够不到它，101 片真穿三角里
+# 79 片被判「未穿」。刀是闭合网格：它从三角内部穿出而三角顶点都在外面，必有网格棱
+# 穿过该三角（截面多边形的顶点就是穿过三角平面的棱）。所以对每个三角查一次静态
+# 棱 BVH（shape 局部系，刚体不变形 ⇒ 永不 refit ⇒ CUDA graph 安全），线段-三角求交，
+# 交点重心坐标取平均作为额外种子，严格变深才接受，之后照旧 refine。力律/锚/反作用不动。
+# 环境变量取值 1 = 凸锐棱、2 = 全部棱：只影响烘焙的棱表，编译产物相同（常量只取开/关）。
+_T52_ON = 1 if int(__import__("os").environ.get("T52_TRI_SDF_EDGE_SEEDS", "0") or 0) != 0 else 0
+_T52_EDGE_SEEDS = wp.constant(_T52_ON)
+# 开关 ON 时关掉本模块的反向（adjoint）代码生成：种子里的动态循环 / 嵌套分支内联进接触核后，
+# NVRTC 卡在无人使用的 adjoint 上（T36 先例：1h51m 编不完 -> 关后 58 s）。求解器不走可微路径，
+# 前向数值不变。OFF 时不调用，模块选项保持原样 ⇒ OFF 路径逐位不变。
+if _T52_ON:
+    wp.set_module_options({"enable_backward": False})
+# 每三角最多访问的候选棱数（固定上限，溢出计数进 gx.t52_diag[0]）。门 1 v1：全部棱档
+# 刀尖附近三角的候选有 478–543 条，256 会截掉交点 ⇒ 4096。
+_T52_VISIT_CAP = wp.constant(65536)
+# 每三角最多对多少个棱交点做「沿棱伪法向往刀内侧偏移」的场评估（每个交点 2 个偏移量）。
+# 门 1 v1：只用交点平均时，交点少或孤岛被三角边界截断，平均点落在刀面上（d≈0）判未穿。
+_T52_EVAL_CAP = wp.constant(16)
+# T59（默认 0 = OFF，codegen 级逐位：常量为 0 时下面每个 `if _T59_SEED_PASS != 0` 都被折叠掉）：
+# F2 种子「拆 pass」。原 v4 在迭代 0 的力核线程里串行做 BVH 遍历 + 最多 ~55 次精确 sdf_query，
+# 核墙钟被最慢线程拖住。ON 时在迭代 0 的力核之前另发三次 launch：
+#   K1 t59_seed_gather_kernel（每 (slot,tri) 一线程）：与 tri_sdf_closest_mesh 同式的质心剔除，
+#      通过的对按原顺序枚举全部探针点（不查场）写进定容缓冲；探针数 > K 或候选数 > 容量的对，
+#      就地用原 t52_seeds_exact 串行算完（同一函数，同一输入）；
+#   K2 t59_probe_eval_kernel（每 (候选, 探针) 一线程）：逐探针 sdf_query，输入与串行版逐位相同；
+#   K3 t59_seed_reduce_kernel（每候选一线程）：按枚举顺序、严格 < 归约出 (found, best, w, n)，
+#      与串行版的比较序列完全相同。
+# 力核迭代 0 只读每对的归约结果，不再内联 t52_seeds_exact（也消掉迭代 1..19 的代码膨胀）。
+# 仅 _T52_EDGE_SEEDS 开时生效；T14 HOLD_DIAG（seed_mode 0）与之不组合（读不到结果时按「无种子」，计数 t59_diag[2]）。
+_T59_SEED_PASS = wp.constant(
+    1 if (_T52_ON and int(__import__("os").environ.get("T59_SEED_PASS", "0") or 0) != 0) else 0
+)
+# 每个候选对最多存多少个探针（c 类最多 16×3 + 1 个均值点，d 类每顶点 2 个；超出的对走 K1 串行）
+_T59_SEED_K = wp.constant(int(__import__("os").environ.get("T59_SEED_K", "64") or 64))
+# T59 零权重诊断（默认 0 = OFF，codegen 折叠；ON 只写 gx.t59_diag，不进任何力 / 位置表达式）：
+# F2 v4 在「found>0 但所有探针返回 bg」时把 w=(0,0,0) 写进缓存且 cvalid=1；迭代>=1 / 反作用 / 投影
+# 读到它时求出的点是刀 shape 局部原点（实测在刀网格表面，d≈0）。计数：
+#   [3] mode-2 接受 w=0 缓存点  [4] 其中 d<h  [5] 反作用核 best<h 且 w=0  [6] 其 f_n 累加（刀侧假力 N）
+#   [7] 力核 best<h 且 w=0  [8] 投影核接受 w=0 缓存点  [9] 力核 w=0 时 depth 累加（m）
+_T59_ZW_DIAG = wp.constant(int(__import__("os").environ.get("T59_ZW_DIAG", "0") or 0))
+#   诊断续:[10] 力核迭代>=1 搜索后 w=0  [11] 力核迭代 0 搜索后 w=0  [12] 反作用核搜索后 w=0
+#   [13] mode-2 接受 w=0 时 d 之和  [14] 其中 d<0 的次数  [15] 其中 d<-1e-6 的次数(诊断全部只用 atomic_add)
+#   [16] w=0 时布上法向力散射模长之和(按 w>0 实际施加的那几项)  [17] w=0 时锚切向力散射模长之和
+#   [18] 反作用核 w=0 且 best<h 时 |reaction| 之和(N)  [19] 其 |torque| 之和(N·m)
+#   [20] w=0 时 T8 锚写入(播种/返回映射)  [21] w=0 时 anchor_dbg2 行写入(T22 c_dat)  [22] w=0 时 tail 行写入
+#   [23] w=0 时 fric_diag 累加  [24] 修复开关触发次数  [25] 诊断开时「本应触发」次数(零权重缓存写入)
+# T59 修复开关（默认 0 = OFF，codegen 折叠）：迭代 0 写缓存时 found>0 但种子最优仍 >= bg（全部探针返回 bg，
+# wbest 停在初值 (0,0,0)）⇒ 写 cvalid=0 而不是 1。wbest 初值不改。计数 t59_diag[24]。
+_T59_SEED_CVALID_FIX = wp.constant(int(__import__("os").environ.get("T59_SEED_CVALID_FIX", "0") or 0))
+# 门 1 v3：种子类别改为运行时位掩码 gx.t52_mask（不重编译即可逐类消融）：
+#   1 = (b) 布三角三条边 × 刀网格（mesh_query_ray 双向取进入点，往里偏 0.05/0.2 mm）
+#   2 = (c) 刀网格棱 × 布三角内部（交点平均 + 每交点两个面内往刀内侧偏移探针）
+#   4 = (d) 刀网格凸锐顶点 → 布三角平面（垂足、沿顶点伪法向轴线与平面交点，落在三角内才评估）
+# (a) 质心 + 三顶点种子始终在。环境变量 T52_TRI_SDF_EDGE_SEEDS 的低 3 位即掩码；+8 = (c) 用全部棱
+# （否则只用凸锐棱 > 30° + 边界棱）；16 = 表建好但掩码为 0（消融基线）。
+
 # T16 SOFT: make the choice of contact point CONTINUOUS instead of a switch.
 #
 # ``_T16_SDF_ARGMIN_TOL`` removed the coin flip but replaced it with a THRESHOLD:
@@ -481,6 +558,690 @@ class SdfGridExact:
     ring_idx: wp.array(dtype=wp.int32)
     robase: wp.array(dtype=wp.int32)
     ribase: wp.array(dtype=wp.int32)
+    # T52 (inert unless _T52_EDGE_SEEDS): rigid-mesh edges in shape local, one
+    # block per DISTINCT mesh (``t52_ebase`` per slot), and a static BVH over the
+    # edge bounds per slot.  ``t52_diag`` is a pure diagnostic accumulator:
+    # [0] visit-cap overflows [1] seeds found [2] seeds accepted.
+    t52_p0: wp.array(dtype=wp.vec3)
+    t52_p1: wp.array(dtype=wp.vec3)
+    t52_n: wp.array(dtype=wp.vec3)
+    t52_ebase: wp.array(dtype=wp.int32)
+    t52_bvh: wp.array(dtype=wp.uint64)
+    # [0] edge-visit overflows [1] triangles with >=1 probe [2] seeds accepted [3] vertex-visit overflows
+    t52_diag: wp.array(dtype=float)
+    # convex sharp vertices + angle-weighted pseudo-normals, static point BVH per slot
+    t52_vp: wp.array(dtype=wp.vec3)
+    t52_vn: wp.array(dtype=wp.vec3)
+    t52_vbase: wp.array(dtype=wp.int32)
+    t52_vbvh: wp.array(dtype=wp.uint64)
+    # per-slot shape mesh (ray queries from the voxel-path projection kernel)
+    t52_mesh: wp.array(dtype=wp.uint64)
+    t52_mask: int
+    # v4 per-(slot, tri) seed cache: best seed barycentric w from iteration 0 of the substep
+    t52_cw: wp.array(dtype=wp.vec3)
+    t52_cvalid: wp.array(dtype=wp.int32)
+    # T59 seed pass (inert unless _T59_SEED_PASS; length-1 dummies otherwise)
+    # per pair: >=0 candidate slot, -1 culled in K1, -2 seeds computed serially in K1
+    t59_pairk: wp.array(dtype=wp.int32)
+    # per candidate slot: pair (-1 = slot abandoned), probe count, query radius
+    t59_kpair: wp.array(dtype=wp.int32)
+    t59_np: wp.array(dtype=wp.int32)
+    t59_rq: wp.array(dtype=float)
+    # per (candidate, probe): point, barycentric w, field value, normal
+    t59_pk: wp.array(dtype=wp.vec3)
+    t59_pw: wp.array(dtype=wp.vec3)
+    t59_pd: wp.array(dtype=float)
+    t59_pn: wp.array(dtype=wp.vec3)
+    # [0] candidates gathered this substep (atomic counter, zeroed before K1)
+    t59_count: wp.array(dtype=wp.int32)
+    t59_cap: int
+    # per pair: reduced seed result (found, best d, w, normal)
+    t59_rn: wp.array(dtype=wp.int32)
+    t59_rd: wp.array(dtype=float)
+    t59_rw: wp.array(dtype=wp.vec3)
+    t59_rnn: wp.array(dtype=wp.vec3)
+    # diagnostics only: [0] gathered [1] computed serially in K1 [2] force kernel found pairk == -1
+    t59_diag: wp.array(dtype=float)
+
+
+@wp.func
+def t52_cross(p0: wp.vec3, d: wp.vec3, a: wp.vec3, e1: wp.vec3, e2: wp.vec3):
+    """Segment p0 -> p0 + d against triangle (a, a + e1, a + e2): (hit, u, v), point = a + u e1 + v e2."""
+    hit = int(0)
+    u = float(0.0)
+    v = float(0.0)
+    hv = wp.cross(d, e2)
+    det = wp.dot(e1, hv)
+    if wp.abs(det) > 1.0e-30:
+        inv = 1.0 / det
+        s = p0 - a
+        u = inv * wp.dot(s, hv)
+        if u >= 0.0 and u <= 1.0:
+            qv = wp.cross(s, e1)
+            v = inv * wp.dot(d, qv)
+            if v >= 0.0 and u + v <= 1.0:
+                tt = inv * wp.dot(e2, qv)
+                if tt >= 0.0 and tt <= 1.0:
+                    hit = 1
+    return hit, u, v
+
+
+@wp.func
+def t52_bary_in(p: wp.vec3, a: wp.vec3, e1: wp.vec3, e2: wp.vec3):
+    """Barycentric coordinates of in-plane point p; (1, w) if inside the triangle, else (0, 0)."""
+    ins = int(0)
+    w = wp.vec3(0.0)
+    v2 = p - a
+    d00 = wp.dot(e1, e1)
+    d01 = wp.dot(e1, e2)
+    d11 = wp.dot(e2, e2)
+    d20 = wp.dot(v2, e1)
+    d21 = wp.dot(v2, e2)
+    den = d00 * d11 - d01 * d01
+    if wp.abs(den) > 1.0e-30:
+        s1 = (d11 * d20 - d01 * d21) / den
+        s2 = (d00 * d21 - d01 * d20) / den
+        if s1 >= 0.0 and s2 >= 0.0 and s1 + s2 <= 1.0:
+            ins = 1
+            w = wp.vec3(1.0 - s1 - s2, s1, s2)
+    return ins, w
+
+
+@wp.func
+def t52_inward(ne: wp.vec3, e1: wp.vec3, e2: wp.vec3):
+    """In-plane direction pointing INTO the solid at a crossing: minus the edge
+    pseudo-normal with its triangle-normal component removed.  (0, 0) if degenerate."""
+    ok = int(0)
+    nt = wp.cross(e1, e2)
+    ln = wp.length(nt)
+    dirv = wp.vec3(0.0)
+    if ln > 1.0e-20:
+        nn = nt / ln
+        dirv = -(ne - nn * wp.dot(ne, nn))
+        li = wp.length(dirv)
+        if li > 1.0e-6:
+            dirv = dirv / li
+            ok = 1
+    return ok, dirv
+
+
+@wp.func
+def t52_edge_bary(k: int, tau: float):
+    """Barycentric point at fraction tau along cloth-triangle edge k (0: a->b, 1: b->c, 2: c->a)."""
+    w = wp.vec3(1.0 - tau, tau, 0.0)
+    if k == 1:
+        w = wp.vec3(0.0, 1.0 - tau, tau)
+    if k == 2:
+        w = wp.vec3(tau, 0.0, 1.0 - tau)
+    return w
+
+
+@wp.func
+def t52_seeds_exact(
+    a: wp.vec3,
+    b: wp.vec3,
+    c: wp.vec3,
+    mesh: wp.uint64,
+    gx: SdfGridExact,
+    slot: int,
+    rq: float,
+    bg: float,
+):
+    """T52 v3 seeds on the exact field, categories by ``gx.t52_mask``:
+    (b) cloth-triangle edges x rigid mesh: ray each edge both ways, probe 0.05/0.2 mm past each ENTRY;
+    (c) rigid edges x triangle interior: mean of crossings + two in-plane probes per crossing;
+    (d) convex sharp rigid vertices: foot on the triangle plane and the plane point on the vertex
+        pseudo-normal axis, if inside the triangle.
+    Returns (n_probed, best d, best w, best normal); n_probed == 0 -> nothing evaluated."""
+    best = bg
+    wbest = wp.vec3(0.0)
+    nbest = wp.vec3(0.0, 0.0, 1.0)
+    found = int(0)
+    e1 = b - a
+    e2 = c - a
+    nt = wp.cross(e1, e2)
+    lnt = wp.length(nt)
+    mask = gx.t52_mask
+    if lnt > 1.0e-20:
+        nn = nt / lnt
+        # ---- (b) triangle edges x mesh
+        if (mask & 1) != 0:
+            for k in range(3):
+                p = a
+                qd = b - a
+                if k == 1:
+                    p = b
+                    qd = c - b
+                if k == 2:
+                    p = c
+                    qd = a - c
+                L = wp.length(qd)
+                if L > 1.0e-12:
+                    dv = qd / L
+                    for side in range(2):
+                        s0 = p
+                        sdv = dv
+                        if side == 1:
+                            s0 = p + qd
+                            sdv = -dv
+                        hq = wp.mesh_query_ray(mesh, s0, sdv, L)
+                        if hq.result:
+                            if wp.dot(sdv, hq.normal) < 0.0:
+                                for j in range(2):
+                                    delta = float(5.0e-5)
+                                    if j == 1:
+                                        delta = 2.0e-4
+                                    sdist = hq.t + delta
+                                    if sdist < L:
+                                        tau = sdist / L
+                                        if side == 1:
+                                            tau = 1.0 - tau
+                                        wk = t52_edge_bary(k, tau)
+                                        pk = a * wk[0] + b * wk[1] + c * wk[2]
+                                        found = found + 1
+                                        dk, nk = sdf_query(mesh, gx, slot, rq, bg, pk)
+                                        if dk < best:
+                                            best = dk
+                                            wbest = wk
+                                            nbest = nk
+        pad = wp.vec3(1.0e-5, 1.0e-5, 1.0e-5)
+        lo = wp.min(wp.min(a, b), c) - pad
+        hi = wp.max(wp.max(a, b), c) + pad
+        # ---- (c) mesh edges x triangle interior
+        if (mask & 2) != 0:
+            ebase = gx.t52_ebase[slot]
+            acc = wp.vec3(0.0)
+            cnt = int(0)
+            nev = int(0)
+            visit = int(0)
+            idx = int(0)
+            q = wp.bvh_query_aabb(gx.t52_bvh[slot], lo, hi)
+            while wp.bvh_query_next(q, idx):
+                visit = visit + 1
+                if visit > _T52_VISIT_CAP:
+                    wp.atomic_add(gx.t52_diag, 0, 1.0)
+                    break
+                p0 = gx.t52_p0[ebase + idx]
+                hit, u, v = t52_cross(p0, gx.t52_p1[ebase + idx] - p0, a, e1, e2)
+                if hit != 0:
+                    acc = acc + wp.vec3(1.0 - u - v, u, v)
+                    cnt = cnt + 1
+                    if nev < _T52_EVAL_CAP:
+                        nev = nev + 1
+                        okd, inw = t52_inward(gx.t52_n[ebase + idx], e1, e2)
+                        if okd != 0:
+                            x = a + e1 * u + e2 * v
+                            for j in range(3):
+                                delta = float(1.0e-5)
+                                if j == 1:
+                                    delta = 5.0e-5
+                                if j == 2:
+                                    delta = 2.0e-4
+                                pk = x + inw * delta
+                                ins, wk = t52_bary_in(pk, a, e1, e2)
+                                if ins != 0:
+                                    found = found + 1
+                                    dk, nk = sdf_query(mesh, gx, slot, rq, bg, pk)
+                                    if dk < best:
+                                        best = dk
+                                        wbest = wk
+                                        nbest = nk
+            if cnt > 0:
+                wa = acc / float(cnt)
+                pa = a * wa[0] + b * wa[1] + c * wa[2]
+                found = found + 1
+                da, na = sdf_query(mesh, gx, slot, rq, bg, pa)
+                if da < best:
+                    best = da
+                    wbest = wa
+                    nbest = na
+        # ---- (d) convex sharp vertices -> triangle plane
+        if (mask & 4) != 0:
+            padv = wp.vec3(1.0e-3, 1.0e-3, 1.0e-3)
+            vbase = gx.t52_vbase[slot]
+            vvisit = int(0)
+            vi = int(0)
+            vq = wp.bvh_query_aabb(gx.t52_vbvh[slot], lo - padv, hi + padv)
+            while wp.bvh_query_next(vq, vi):
+                vvisit = vvisit + 1
+                if vvisit > _T52_VISIT_CAP:
+                    wp.atomic_add(gx.t52_diag, 3, 1.0)
+                    break
+                vp = gx.t52_vp[vbase + vi]
+                hgt = wp.dot(vp - a, nn)
+                for j in range(2):
+                    pk = vp - nn * hgt
+                    okj = int(1)
+                    if j == 1:
+                        okj = 0
+                        vnrm = gx.t52_vn[vbase + vi]
+                        den = wp.dot(vnrm, nn)
+                        if wp.abs(den) > 0.2:
+                            pk = vp - vnrm * (hgt / den)
+                            okj = 1
+                    if okj != 0:
+                        ins, wk = t52_bary_in(pk, a, e1, e2)
+                        if ins != 0:
+                            found = found + 1
+                            dk, nk = sdf_query(mesh, gx, slot, rq, bg, pk)
+                            if dk < best:
+                                best = dk
+                                wbest = wk
+                                nbest = nk
+    return found, best, wbest, nbest
+
+
+@wp.func
+def t59_store_probe(gx: SdfGridExact, kc: int, n: int, pk: wp.vec3, wk: wp.vec3):
+    """T59: store probe ``n`` of candidate ``kc``; returns n + 1, or -1 once the per-candidate capacity is exceeded."""
+    r = int(-1)
+    if n >= 0:
+        if n < _T59_SEED_K:
+            i = kc * _T59_SEED_K + n
+            gx.t59_pk[i] = pk
+            gx.t59_pw[i] = wk
+            r = n + 1
+    return r
+
+
+@wp.func
+def t59_seed_enum(
+    a: wp.vec3,
+    b: wp.vec3,
+    c: wp.vec3,
+    mesh: wp.uint64,
+    gx: SdfGridExact,
+    slot: int,
+    kc: int,
+):
+    """T59: ``t52_seeds_exact`` with every ``sdf_query`` replaced by storing the probe.
+
+    Statement for statement the same enumeration (same point / barycentric expressions,
+    same order, same inside tests), so the stored sequence is exactly the sequence of
+    points the serial search evaluates and compares.  Returns the probe count, or -1 if
+    the candidate needs more than ``_T59_SEED_K`` slots (the caller then runs the serial
+    search instead)."""
+    n = int(0)
+    e1 = b - a
+    e2 = c - a
+    nt = wp.cross(e1, e2)
+    lnt = wp.length(nt)
+    mask = gx.t52_mask
+    if lnt > 1.0e-20:
+        nn = nt / lnt
+        # ---- (b) triangle edges x mesh
+        if (mask & 1) != 0:
+            for k in range(3):
+                p = a
+                qd = b - a
+                if k == 1:
+                    p = b
+                    qd = c - b
+                if k == 2:
+                    p = c
+                    qd = a - c
+                L = wp.length(qd)
+                if L > 1.0e-12:
+                    dv = qd / L
+                    for side in range(2):
+                        s0 = p
+                        sdv = dv
+                        if side == 1:
+                            s0 = p + qd
+                            sdv = -dv
+                        hq = wp.mesh_query_ray(mesh, s0, sdv, L)
+                        if hq.result:
+                            if wp.dot(sdv, hq.normal) < 0.0:
+                                for j in range(2):
+                                    delta = float(5.0e-5)
+                                    if j == 1:
+                                        delta = 2.0e-4
+                                    sdist = hq.t + delta
+                                    if sdist < L:
+                                        tau = sdist / L
+                                        if side == 1:
+                                            tau = 1.0 - tau
+                                        wk = t52_edge_bary(k, tau)
+                                        pk = a * wk[0] + b * wk[1] + c * wk[2]
+                                        n = t59_store_probe(gx, kc, n, pk, wk)
+        pad = wp.vec3(1.0e-5, 1.0e-5, 1.0e-5)
+        lo = wp.min(wp.min(a, b), c) - pad
+        hi = wp.max(wp.max(a, b), c) + pad
+        # ---- (c) mesh edges x triangle interior
+        if (mask & 2) != 0:
+            ebase = gx.t52_ebase[slot]
+            acc = wp.vec3(0.0)
+            cnt = int(0)
+            nev = int(0)
+            visit = int(0)
+            idx = int(0)
+            q = wp.bvh_query_aabb(gx.t52_bvh[slot], lo, hi)
+            while wp.bvh_query_next(q, idx):
+                visit = visit + 1
+                if visit > _T52_VISIT_CAP:
+                    wp.atomic_add(gx.t52_diag, 0, 1.0)
+                    break
+                p0 = gx.t52_p0[ebase + idx]
+                hit, u, v = t52_cross(p0, gx.t52_p1[ebase + idx] - p0, a, e1, e2)
+                if hit != 0:
+                    acc = acc + wp.vec3(1.0 - u - v, u, v)
+                    cnt = cnt + 1
+                    if nev < _T52_EVAL_CAP:
+                        nev = nev + 1
+                        okd, inw = t52_inward(gx.t52_n[ebase + idx], e1, e2)
+                        if okd != 0:
+                            x = a + e1 * u + e2 * v
+                            for j in range(3):
+                                delta = float(1.0e-5)
+                                if j == 1:
+                                    delta = 5.0e-5
+                                if j == 2:
+                                    delta = 2.0e-4
+                                pk = x + inw * delta
+                                ins, wk = t52_bary_in(pk, a, e1, e2)
+                                if ins != 0:
+                                    n = t59_store_probe(gx, kc, n, pk, wk)
+            if cnt > 0:
+                wa = acc / float(cnt)
+                pa = a * wa[0] + b * wa[1] + c * wa[2]
+                n = t59_store_probe(gx, kc, n, pa, wa)
+        # ---- (d) convex sharp vertices -> triangle plane
+        if (mask & 4) != 0:
+            padv = wp.vec3(1.0e-3, 1.0e-3, 1.0e-3)
+            vbase = gx.t52_vbase[slot]
+            vvisit = int(0)
+            vi = int(0)
+            vq = wp.bvh_query_aabb(gx.t52_vbvh[slot], lo - padv, hi + padv)
+            while wp.bvh_query_next(vq, vi):
+                vvisit = vvisit + 1
+                if vvisit > _T52_VISIT_CAP:
+                    wp.atomic_add(gx.t52_diag, 3, 1.0)
+                    break
+                vp = gx.t52_vp[vbase + vi]
+                hgt = wp.dot(vp - a, nn)
+                for j in range(2):
+                    pk = vp - nn * hgt
+                    okj = int(1)
+                    if j == 1:
+                        okj = 0
+                        vnrm = gx.t52_vn[vbase + vi]
+                        den = wp.dot(vnrm, nn)
+                        if wp.abs(den) > 0.2:
+                            pk = vp - vnrm * (hgt / den)
+                            okj = 1
+                    if okj != 0:
+                        ins, wk = t52_bary_in(pk, a, e1, e2)
+                        if ins != 0:
+                            n = t59_store_probe(gx, kc, n, pk, wk)
+    return n
+
+
+@wp.kernel
+def t59_seed_gather_kernel(
+    pos: wp.array(dtype=wp.vec3),
+    tri_indices: wp.array2d(dtype=wp.int32),
+    tri_count: int,
+    slot_shape: wp.array(dtype=int),
+    shape_body: wp.array(dtype=int),
+    shape_transform: wp.array(dtype=wp.transform),
+    body_q: wp.array(dtype=wp.transform),
+    sdf_mesh: wp.array(dtype=wp.uint64),
+    gx: SdfGridExact,
+    bg: float,
+    half_thickness: float,
+):
+    """T59 K1: per (slot, tri) pair, the force kernel's local triangle and the
+    ``tri_sdf_closest_mesh`` centroid rejection, then enumerate the seed probes."""
+    pair = wp.tid()
+    slot = pair / tri_count
+    t = pair - slot * tri_count
+
+    shape = slot_shape[slot]
+    body = shape_body[shape]
+    X_ws = shape_transform[shape]
+    if body >= 0:
+        X_ws = body_q[body] * shape_transform[shape]
+    X_sw = wp.transform_inverse(X_ws)
+
+    i0 = tri_indices[t, 0]
+    i1 = tri_indices[t, 1]
+    i2 = tri_indices[t, 2]
+    a = wp.transform_point(X_sw, pos[i0])
+    b = wp.transform_point(X_sw, pos[i1])
+    c = wp.transform_point(X_sw, pos[i2])
+
+    mesh = sdf_mesh[slot]
+    cull = half_thickness
+    # --- verbatim from tri_sdf_closest_mesh
+    third = 1.0 / 3.0
+    g = (a + b + c) * third
+    reach = wp.max(wp.length(a - g), wp.max(wp.length(b - g), wp.length(c - g)))
+    rq = cull + 2.0 * reach
+    best, nbest = sdf_query(mesh, gx, slot, cull + reach, bg, g)
+    if best >= bg:
+        gx.t59_pairk[pair] = -1
+        return
+    if _T14_SDF_RQ != 0:
+        rq = wp.abs(best) + reach + 1.0e-6
+    # ---
+    kc = wp.atomic_add(gx.t59_count, 0, 1)
+    if kc < gx.t59_cap:
+        wp.atomic_add(gx.t59_diag, 0, 1.0)
+        n = t59_seed_enum(a, b, c, mesh, gx, slot, kc)
+        if n >= 0:
+            gx.t59_kpair[kc] = pair
+            gx.t59_rq[kc] = rq
+            gx.t59_np[kc] = n
+            gx.t59_pairk[pair] = kc
+            return
+        gx.t59_kpair[kc] = -1
+        gx.t59_np[kc] = 0
+    # capacity or per-candidate probe overflow: the serial search, same function, same inputs
+    n_s, d_s, w_s, nn_s = t52_seeds_exact(a, b, c, mesh, gx, slot, rq, bg)
+    gx.t59_rn[pair] = n_s
+    gx.t59_rd[pair] = d_s
+    gx.t59_rw[pair] = w_s
+    gx.t59_rnn[pair] = nn_s
+    gx.t59_pairk[pair] = -2
+    wp.atomic_add(gx.t59_diag, 1, 1.0)
+
+
+@wp.kernel
+def t59_probe_eval_kernel(
+    tri_count: int,
+    sdf_mesh: wp.array(dtype=wp.uint64),
+    gx: SdfGridExact,
+    bg: float,
+):
+    """T59 K2: one thread per (candidate, probe) slot; the serial search's ``sdf_query`` on the stored point."""
+    tid = wp.tid()
+    kc = tid / _T59_SEED_K
+    j = tid - kc * _T59_SEED_K
+    if kc >= wp.min(gx.t59_count[0], gx.t59_cap):
+        return
+    if j >= gx.t59_np[kc]:
+        return
+    pair = gx.t59_kpair[kc]
+    slot = pair / tri_count
+    dk, nk = sdf_query(sdf_mesh[slot], gx, slot, gx.t59_rq[kc], bg, gx.t59_pk[tid])
+    gx.t59_pd[tid] = dk
+    gx.t59_pn[tid] = nk
+
+
+@wp.kernel
+def t59_seed_reduce_kernel(
+    gx: SdfGridExact,
+    bg: float,
+):
+    """T59 K3: one thread per candidate; the serial search's comparison sequence
+    (initial ``bg`` / zero w / +z normal, strict ``<``, enumeration order)."""
+    kc = wp.tid()
+    if kc >= wp.min(gx.t59_count[0], gx.t59_cap):
+        return
+    pair = gx.t59_kpair[kc]
+    if pair < 0:
+        return
+    n = gx.t59_np[kc]
+    best = bg
+    wbest = wp.vec3(0.0)
+    nbest = wp.vec3(0.0, 0.0, 1.0)
+    base = kc * _T59_SEED_K
+    for j in range(n):
+        dk = gx.t59_pd[base + j]
+        if dk < best:
+            best = dk
+            wbest = gx.t59_pw[base + j]
+            nbest = gx.t59_pn[base + j]
+    gx.t59_rn[pair] = n
+    gx.t59_rd[pair] = best
+    gx.t59_rw[pair] = wbest
+    gx.t59_rnn[pair] = nbest
+
+
+@wp.func
+def t52_seeds_voxel(
+    a: wp.vec3,
+    b: wp.vec3,
+    c: wp.vec3,
+    gx: SdfGridExact,
+    slot: int,
+    sdf: wp.array(dtype=float),
+    base: int,
+    nx: int,
+    ny: int,
+    nz: int,
+    org: wp.vec3,
+    inv_voxel: float,
+    bg: float,
+):
+    """Same probes as ``t52_seeds_exact``, evaluated on the trilinear voxel field (projection kernel)."""
+    best = bg
+    wbest = wp.vec3(0.0)
+    found = int(0)
+    e1 = b - a
+    e2 = c - a
+    nt = wp.cross(e1, e2)
+    lnt = wp.length(nt)
+    mask = gx.t52_mask
+    mesh = gx.t52_mesh[slot]
+    if lnt > 1.0e-20:
+        nn = nt / lnt
+        if (mask & 1) != 0:
+            for k in range(3):
+                p = a
+                qd = b - a
+                if k == 1:
+                    p = b
+                    qd = c - b
+                if k == 2:
+                    p = c
+                    qd = a - c
+                L = wp.length(qd)
+                if L > 1.0e-12:
+                    dv = qd / L
+                    for side in range(2):
+                        s0 = p
+                        sdv = dv
+                        if side == 1:
+                            s0 = p + qd
+                            sdv = -dv
+                        hq = wp.mesh_query_ray(mesh, s0, sdv, L)
+                        if hq.result:
+                            if wp.dot(sdv, hq.normal) < 0.0:
+                                for j in range(2):
+                                    delta = float(5.0e-5)
+                                    if j == 1:
+                                        delta = 2.0e-4
+                                    sdist = hq.t + delta
+                                    if sdist < L:
+                                        tau = sdist / L
+                                        if side == 1:
+                                            tau = 1.0 - tau
+                                        wk = t52_edge_bary(k, tau)
+                                        pk = a * wk[0] + b * wk[1] + c * wk[2]
+                                        found = found + 1
+                                        dk = sdf_grid_sample(sdf, base, nx, ny, nz, org, inv_voxel, bg, pk)
+                                        if dk < best:
+                                            best = dk
+                                            wbest = wk
+        pad = wp.vec3(1.0e-5, 1.0e-5, 1.0e-5)
+        lo = wp.min(wp.min(a, b), c) - pad
+        hi = wp.max(wp.max(a, b), c) + pad
+        if (mask & 2) != 0:
+            ebase = gx.t52_ebase[slot]
+            acc = wp.vec3(0.0)
+            cnt = int(0)
+            nev = int(0)
+            visit = int(0)
+            idx = int(0)
+            q = wp.bvh_query_aabb(gx.t52_bvh[slot], lo, hi)
+            while wp.bvh_query_next(q, idx):
+                visit = visit + 1
+                if visit > _T52_VISIT_CAP:
+                    break
+                p0 = gx.t52_p0[ebase + idx]
+                hit, u, v = t52_cross(p0, gx.t52_p1[ebase + idx] - p0, a, e1, e2)
+                if hit != 0:
+                    acc = acc + wp.vec3(1.0 - u - v, u, v)
+                    cnt = cnt + 1
+                    if nev < _T52_EVAL_CAP:
+                        nev = nev + 1
+                        okd, inw = t52_inward(gx.t52_n[ebase + idx], e1, e2)
+                        if okd != 0:
+                            x = a + e1 * u + e2 * v
+                            for j in range(3):
+                                delta = float(1.0e-5)
+                                if j == 1:
+                                    delta = 5.0e-5
+                                if j == 2:
+                                    delta = 2.0e-4
+                                pk = x + inw * delta
+                                ins, wk = t52_bary_in(pk, a, e1, e2)
+                                if ins != 0:
+                                    found = found + 1
+                                    dk = sdf_grid_sample(sdf, base, nx, ny, nz, org, inv_voxel, bg, pk)
+                                    if dk < best:
+                                        best = dk
+                                        wbest = wk
+            if cnt > 0:
+                wa = acc / float(cnt)
+                pa = a * wa[0] + b * wa[1] + c * wa[2]
+                found = found + 1
+                da = sdf_grid_sample(sdf, base, nx, ny, nz, org, inv_voxel, bg, pa)
+                if da < best:
+                    best = da
+                    wbest = wa
+        if (mask & 4) != 0:
+            padv = wp.vec3(1.0e-3, 1.0e-3, 1.0e-3)
+            vbase = gx.t52_vbase[slot]
+            vvisit = int(0)
+            vi = int(0)
+            vq = wp.bvh_query_aabb(gx.t52_vbvh[slot], lo - padv, hi + padv)
+            while wp.bvh_query_next(vq, vi):
+                vvisit = vvisit + 1
+                if vvisit > _T52_VISIT_CAP:
+                    break
+                vp = gx.t52_vp[vbase + vi]
+                hgt = wp.dot(vp - a, nn)
+                for j in range(2):
+                    pk = vp - nn * hgt
+                    okj = int(1)
+                    if j == 1:
+                        okj = 0
+                        vnrm = gx.t52_vn[vbase + vi]
+                        den = wp.dot(vnrm, nn)
+                        if wp.abs(den) > 0.2:
+                            pk = vp - vnrm * (hgt / den)
+                            okj = 1
+                    if okj != 0:
+                        ins, wk = t52_bary_in(pk, a, e1, e2)
+                        if ins != 0:
+                            found = found + 1
+                            dk = sdf_grid_sample(sdf, base, nx, ny, nz, org, inv_voxel, bg, pk)
+                            if dk < best:
+                                best = dk
+                                wbest = wk
+    return found, best, wbest
 
 
 @wp.kernel
@@ -2551,6 +3312,8 @@ def project_tri_sdf_kernel(
     half_thickness: float,
     max_correction: float,
     refine_steps: int,
+    # T52: edge-crossing seeds (inert unless _T52_EDGE_SEEDS)
+    gx: SdfGridExact,
     # outputs
     delta: wp.array(dtype=wp.vec3),
     delta_weight: wp.array(dtype=float),
@@ -2603,6 +3366,18 @@ def project_tri_sdf_kernel(
     if dc < best:
         best = dc
         w = wp.vec3(0.0, 0.0, 1.0)
+    if _T52_EDGE_SEEDS != 0:
+        # T52 v4: the seed the force kernel stored at iteration 0 of this substep, on this kernel's field
+        if gx.t52_cvalid[tid] != 0:
+            w_c52 = gx.t52_cw[tid]
+            p_c52 = a * w_c52[0] + b * w_c52[1] + c * w_c52[2]
+            d_c52 = sdf_grid_sample(sdf, base, nx, ny, nz, org, inv_voxel, bg, p_c52)
+            if d_c52 < best:
+                best = d_c52
+                w = w_c52
+                if _T59_ZW_DIAG != 0:
+                    if w_c52[0] == 0.0 and w_c52[1] == 0.0 and w_c52[2] == 0.0:
+                        wp.atomic_add(gx.t59_diag, 8, 1.0)
     if best >= bg:
         return
 
@@ -2630,12 +3405,17 @@ def project_tri_sdf_kernel(
                     w = cand
         step = step * 0.5
 
-    if best >= half_thickness:
+    # T42-A: two-stage. OFF (constant 0) folds away -> `target = half_thickness`,
+    # i.e. bit-identical to the single-stage form this kernel always had.
+    target = half_thickness
+    if _T42_TRI_DEEP_ONLY > 0.0:
+        target = -_T42_TRI_DEEP_ONLY
+    if best >= target:
         return
 
     p = a * w[0] + b * w[1] + c * w[2]
     n_local = sdf_grid_gradient(sdf, base, nx, ny, nz, org, inv_voxel, bg, voxel, p)
-    push = wp.min(half_thickness - best, max_correction)
+    push = wp.min(target - best, max_correction)
     n_world = wp.transform_vector(X_ws, n_local)
     denom = w[0] * w[0] + w[1] * w[1] + w[2] * w[2]
     scale = push / wp.max(denom, 1.0e-6)
@@ -3054,6 +3834,8 @@ def tri_sdf_closest_mesh(
     bg: float,
     cull: float,
     refine_steps: int,
+    pair: int,
+    seed_mode: int,
 ):
     """``tri_sdf_closest`` on the exact field: same search, exact evaluations.
 
@@ -3117,6 +3899,108 @@ def tri_sdf_closest_mesh(
         nbest = nc
         if _T14_SDF_SKIPREF != 0:
             p_best = c
+    if _T52_EDGE_SEEDS != 0:
+        # T52: rigid-feature seeds (categories in gx.t52_mask).  seed_mode 0 = compute every call;
+        # 1 = compute and store the best seed w for this (slot, tri) -- iteration 0 of the substep;
+        # 2 = read the stored seed and evaluate the field there once (iterations 1..19, reaction).
+        # Strictly-deeper acceptance, then the same refinement.
+        if seed_mode == 2:
+            if gx.t52_cvalid[pair] != 0:
+                w_c52 = gx.t52_cw[pair]
+                p_c52 = a * w_c52[0] + b * w_c52[1] + c * w_c52[2]
+                d_c52, n_c52 = sdf_query(mesh, gx, slot, rq, bg, p_c52)
+                if d_c52 < best - tol:
+                    wp.atomic_add(gx.t52_diag, 2, 1.0)
+                    if _T59_ZW_DIAG != 0:
+                        if w_c52[0] == 0.0 and w_c52[1] == 0.0 and w_c52[2] == 0.0:
+                            wp.atomic_add(gx.t59_diag, 3, 1.0)
+                            if d_c52 < cull:
+                                wp.atomic_add(gx.t59_diag, 4, 1.0)
+                            wp.atomic_add(gx.t59_diag, 13, d_c52)
+                            if d_c52 < 0.0:
+                                wp.atomic_add(gx.t59_diag, 14, 1.0)
+                            if d_c52 < -1.0e-6:
+                                wp.atomic_add(gx.t59_diag, 15, 1.0)
+                    best = d_c52
+                    w = w_c52
+                    nbest = n_c52
+                    if _T14_SDF_SKIPREF != 0:
+                        p_best = p_c52
+        else:
+            if _T59_SEED_PASS != 0:
+                # T59: the seed pass (K1-K3) already ran for this substep; read its result.
+                n_t59 = int(0)
+                d_t59 = float(bg)
+                w_t59 = wp.vec3(0.0)
+                nn_t59 = wp.vec3(0.0, 0.0, 1.0)
+                k_t59 = int(-1)
+                if seed_mode == 1:
+                    k_t59 = gx.t59_pairk[pair]
+                if k_t59 >= 0:
+                    # T59 v2: K3 folded in -- the serial search's comparison sequence over the
+                    # probes K2 evaluated (same initial bg / zero w / +z normal, strict '<', enumeration order).
+                    n_t59 = gx.t59_np[k_t59]
+                    base_t59 = k_t59 * _T59_SEED_K
+                    for j_t59 in range(n_t59):
+                        dk_t59 = gx.t59_pd[base_t59 + j_t59]
+                        if dk_t59 < d_t59:
+                            d_t59 = dk_t59
+                            w_t59 = gx.t59_pw[base_t59 + j_t59]
+                            nn_t59 = gx.t59_pn[base_t59 + j_t59]
+                elif k_t59 == -2:
+                    # computed serially in K1 (capacity / probe overflow)
+                    n_t59 = gx.t59_rn[pair]
+                    d_t59 = gx.t59_rd[pair]
+                    w_t59 = gx.t59_rw[pair]
+                    nn_t59 = gx.t59_rnn[pair]
+                else:
+                    wp.atomic_add(gx.t59_diag, 2, 1.0)
+                if seed_mode == 1:
+                    if n_t59 > 0:
+                        gx.t52_cw[pair] = w_t59
+                        gx.t52_cvalid[pair] = 1
+                        if _T59_SEED_CVALID_FIX != 0:
+                            if d_t59 >= bg:
+                                gx.t52_cvalid[pair] = 0
+                                wp.atomic_add(gx.t59_diag, 24, 1.0)
+                        if _T59_ZW_DIAG != 0:
+                            if d_t59 >= bg:
+                                wp.atomic_add(gx.t59_diag, 25, 1.0)
+                    else:
+                        gx.t52_cvalid[pair] = 0
+                if n_t59 > 0:
+                    wp.atomic_add(gx.t52_diag, 1, 1.0)
+                    if d_t59 < best - tol:
+                        wp.atomic_add(gx.t52_diag, 2, 1.0)
+                        best = d_t59
+                        w = w_t59
+                        nbest = nn_t59
+                        if _T14_SDF_SKIPREF != 0:
+                            p_best = a * w_t59[0] + b * w_t59[1] + c * w_t59[2]
+            else:
+                n_s52, d_s52, w_s52, nn_s52 = t52_seeds_exact(a, b, c, mesh, gx, slot, rq, bg)
+                if seed_mode == 1:
+                    if n_s52 > 0:
+                        gx.t52_cw[pair] = w_s52
+                        gx.t52_cvalid[pair] = 1
+                        if _T59_SEED_CVALID_FIX != 0:
+                            if d_s52 >= bg:
+                                gx.t52_cvalid[pair] = 0
+                                wp.atomic_add(gx.t59_diag, 24, 1.0)
+                        if _T59_ZW_DIAG != 0:
+                            if d_s52 >= bg:
+                                wp.atomic_add(gx.t59_diag, 25, 1.0)
+                    else:
+                        gx.t52_cvalid[pair] = 0
+                if n_s52 > 0:
+                    wp.atomic_add(gx.t52_diag, 1, 1.0)
+                    if d_s52 < best - tol:
+                        wp.atomic_add(gx.t52_diag, 2, 1.0)
+                        best = d_s52
+                        w = w_s52
+                        nbest = nn_s52
+                        if _T14_SDF_SKIPREF != 0:
+                            p_best = a * w_s52[0] + b * w_s52[1] + c * w_s52[2]
     if _T16_SDF_ARGMIN_SOFT != 0.0:
         # softmin over the four seeds -> a CONTINUOUS starting point, then the
         # same descent from there.  One extra field evaluation (at the blend).
@@ -3283,6 +4167,15 @@ def eval_tri_sdf_contact_kernel(
         else:
             if bp_overflow[0] == 0:
                 return
+    if _T59_SEED_PASS != 0:
+        if anchor_seed != 0:
+            # T59 v3: iteration 0 -- K1 already ran tri_sdf_closest_mesh's centroid rejection on exactly
+            # these inputs (same pos / body_q arrays, verbatim expressions).  A rejected pair here would
+            # return from the search with best >= bg and reach only the anchor drop below; do just that.
+            if gx.t59_pairk[pair] == -1:
+                if anchor_kt_ratio > 0.0:
+                    anchor_valid[pair] = 0
+                return
     slot = pair / tri_count
     t = pair - slot * tri_count
 
@@ -3337,7 +4230,7 @@ def eval_tri_sdf_contact_kernel(
         if _T14_SDF_HOLD_DIAG != 0:
             # what the un-held code would have said at this same iterate
             w_t, best_t, n_t = tri_sdf_closest_mesh(
-                a, b, c, sdf_mesh[slot], gx, slot, bg, half_thickness, refine_steps
+                a, b, c, sdf_mesh[slot], gx, slot, bg, half_thickness, refine_steps, pair, 0
             )
             if best_t < bg:
                 d = wp.abs(best - best_t)
@@ -3383,7 +4276,7 @@ def eval_tri_sdf_contact_kernel(
     elif _R16_SDF_EXACT != 0:
         # R16-A2': same search, exact field.  The freeze switch is a grid-path
         # remedy for the winner-take-all redraw and is not combined with it.
-        w, best, n_exact = tri_sdf_closest_mesh(a, b, c, sdf_mesh[slot], gx, slot, bg, half_thickness, refine_steps)
+        w, best, n_exact = tri_sdf_closest_mesh(a, b, c, sdf_mesh[slot], gx, slot, bg, half_thickness, refine_steps, pair, wp.where(anchor_seed != 0, 1, 2))
     elif _R13G_SDF_FREEZE == 0:
         w, best = tri_sdf_closest(
                 a, b, c, sdf, base, nx, ny, nz, org, inv_voxel, voxel, bg, refine_steps,
@@ -3420,6 +4313,12 @@ def eval_tri_sdf_contact_kernel(
                 hold_p[pair] = (a * w[0] + b * w[1] + c * w[2]) - n_exact * best
             else:
                 hold_valid[pair] = 0
+    if _T59_ZW_DIAG != 0:
+        if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+            if anchor_seed != 0:
+                wp.atomic_add(gx.t59_diag, 11, 1.0)
+            else:
+                wp.atomic_add(gx.t59_diag, 10, 1.0)
     if best >= half_thickness:
         # T8: the pair separated -> drop the anchor.  Seeding/holding is keyed on
         # GEOMETRIC contact (best <= h), not on the force band, so a pair that
@@ -3429,6 +4328,10 @@ def eval_tri_sdf_contact_kernel(
         return
 
     depth = wp.min(half_thickness - best, max_depth)
+    if _T59_ZW_DIAG != 0:
+        if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+            wp.atomic_add(gx.t59_diag, 7, 1.0)
+            wp.atomic_add(gx.t59_diag, 9, depth)
     p = a * w[0] + b * w[1] + c * w[2]
     n_local = wp.vec3(0.0, 0.0, 1.0)
     if _R16_SDF_EXACT != 0:
@@ -3648,6 +4551,9 @@ def eval_tri_sdf_contact_kernel(
                     + wp.transform_point(X_sw_p, pos[i2]) * aw[2]
                 )
                 if seeded == 0:
+                    if _T59_ZW_DIAG != 0:
+                        if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+                            wp.atomic_add(gx.t59_diag, 20, 1.0)
                     anchor_w[pair] = w
                     seed_p = q_prev_loc
                     if _T18_FIX_TAN != 0:
@@ -3697,6 +4603,9 @@ def eval_tri_sdf_contact_kernel(
                             keep_len = lp - drag
                         keep = wp.transform_vector(X_sw_p, sp_t * (keep_len / lp))
                         anchor_p[pair] = q_prev_loc - keep
+                        if _T59_ZW_DIAG != 0:
+                            if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+                                wp.atomic_add(gx.t59_diag, 20, 1.0)
                 if _T18_FIX_DRAG != 0:
                     anchor_qp[pair] = q_prev_loc
             slip_loc = wp.vec3(0.0, 0.0, 0.0)
@@ -3787,6 +4696,9 @@ def eval_tri_sdf_contact_kernel(
             # T13 逐对向量诊断（纯输出）。f_t_a 已是钳制后的最终切向力，
             # best_seed 用与内核同一个后端查询函数对播种材料点 q_loc 再查一次。
             if dbg_when != 0 and anchor_dbg2.shape[0] > 1:
+                if _T59_ZW_DIAG != 0:
+                    if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+                        wp.atomic_add(gx.t59_diag, 21, 1.0)
                 q_search_w = wp.transform_point(X_ws, a * w[0] + b * w[1] + c * w[2])
                 q_seed_w = wp.transform_point(X_ws, q_loc)
                 best_seed = float(bg)
@@ -3820,6 +4732,9 @@ def eval_tri_sdf_contact_kernel(
                 anchor_dbg2[pair, 18] = float(slot)
                 anchor_dbg2[pair, 19] = cone
             if anchor_tail != 0 and anchor_dbg2.shape[0] > 1:
+                if _T59_ZW_DIAG != 0:
+                    if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+                        wp.atomic_add(gx.t59_diag, 22, 1.0)
                 # T18：同一跑里再记一份「最后一次 Newton 迭代」的切向力与偏移。
                 # 迭代 0 的那一份是试探值（pos 还是 x_prev）；这一份才是这个
                 # substep 真正被施加的力。两份放同一个数组的不同槽位，就能
@@ -3863,6 +4778,9 @@ def eval_tri_sdf_contact_kernel(
             ft_diag = f_t
             cone_diag = mu * f_n
     if fric_diag_accum != 0 and fric_diag.shape[0] > 1:
+        if _T59_ZW_DIAG != 0:
+            if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+                wp.atomic_add(gx.t59_diag, 23, 1.0)
         # T18 P-9 仪器：逐 shape 14 槽
         # 0 Sigma|f_t| | 1 Sigma f_n | 2 受载对数 | 3 Sigma cone | 4 在锥上的对数
         # 5 Sigma|slip_t| | 6 Sigma slip_max | 7-9 Sigma f_t（矢量和，世界系）
@@ -3915,6 +4833,24 @@ def eval_tri_sdf_contact_kernel(
         # 是保 SPD 的标准集总，对角正好复现该模态的真刚度。
         # 只动切向块：法向的 hw 不碰（法向通道实测对此不敏感，N 变化 <1.5%）。
         haw = aw_out
+    if _T59_ZW_DIAG != 0:
+        if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+            fs59 = float(0.0)
+            if w[0] > 0.0:
+                fs59 = fs59 + wp.length(f * w[0])
+            if w[1] > 0.0:
+                fs59 = fs59 + wp.length(f * w[1])
+            if w[2] > 0.0:
+                fs59 = fs59 + wp.length(f * w[2])
+            ft59 = float(0.0)
+            if aw_out[0] > 0.0:
+                ft59 = ft59 + wp.length(f_t_a * aw_out[0])
+            if aw_out[1] > 0.0:
+                ft59 = ft59 + wp.length(f_t_a * aw_out[1])
+            if aw_out[2] > 0.0:
+                ft59 = ft59 + wp.length(f_t_a * aw_out[2])
+            wp.atomic_add(gx.t59_diag, 16, fs59)
+            wp.atomic_add(gx.t59_diag, 17, ft59)
     if aw_out[0] > 0.0:
         wp.atomic_add(forces, i0, f_t_a * aw_out[0])
         wp.atomic_add(hessians, i0, nn_t_a * haw[0])
@@ -4105,7 +5041,7 @@ def accumulate_tri_sdf_reaction_kernel(
     elif _R16_SDF_EXACT != 0:
         # R16-A2': identical query to the force pass, so the two halves of the
         # contact cannot disagree about where or how deep it is.
-        w, best, n_exact = tri_sdf_closest_mesh(a, b, c, sdf_mesh[slot], gx, slot, bg, half_thickness, refine_steps)
+        w, best, n_exact = tri_sdf_closest_mesh(a, b, c, sdf_mesh[slot], gx, slot, bg, half_thickness, refine_steps, pair, 2)
     elif _R13G_SDF_FREEZE == 0:
         w, best = tri_sdf_closest(
                 a, b, c, sdf, base, nx, ny, nz, org, inv_voxel, voxel, bg, refine_steps,
@@ -4127,6 +5063,9 @@ def accumulate_tri_sdf_reaction_kernel(
             best = sdf_grid_sample(
                 sdf, base, nx, ny, nz, org, inv_voxel, bg, a * w[0] + b * w[1] + c * w[2]
             )
+    if _T59_ZW_DIAG != 0:
+        if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+            wp.atomic_add(gx.t59_diag, 12, 1.0)
     if best >= half_thickness:
         return
 
@@ -4177,6 +5116,10 @@ def accumulate_tri_sdf_reaction_kernel(
             )
     reaction = n_world * (-f_n)
     p_world = wp.transform_point(X_ws, p_local)
+    if _T59_ZW_DIAG != 0:
+        if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+            wp.atomic_add(gx.t59_diag, 5, 1.0)
+            wp.atomic_add(gx.t59_diag, 6, f_n)
     # R13f: the tangential half of the same contact, equal and opposite.
     # Re-evaluated with the identical inputs as the force kernel so the two
     # sides cannot disagree.  OFF branch leaves ``reaction`` untouched.
@@ -4214,6 +5157,10 @@ def accumulate_tri_sdf_reaction_kernel(
             )
             reaction = reaction - f_t
     com = wp.transform_point(body_q[body], body_com[body])
+    if _T59_ZW_DIAG != 0:
+        if w[0] == 0.0 and w[1] == 0.0 and w[2] == 0.0:
+            wp.atomic_add(gx.t59_diag, 18, wp.length(reaction))
+            wp.atomic_add(gx.t59_diag, 19, wp.length(wp.cross(p_world - com, reaction)))
     wp.atomic_add(body_f, body, wp.spatial_vector(reaction, wp.cross(p_world - com, reaction)))
 
 
