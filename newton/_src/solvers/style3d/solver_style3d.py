@@ -505,6 +505,7 @@ class SolverStyle3D(SolverBase):
         inertia_warm_start: bool | str = False,
         coarse_correction: int = 0,
         inertia_warm_start_v_gate: float = 0.05,
+        linear_iterations_it0: int | None = None,
     ):
         """
         Args:
@@ -535,6 +536,12 @@ class SolverStyle3D(SolverBase):
                 before ITER3.  Naming a schedule EXPLICITLY makes it apply to BOTH
                 paths (ITER3 change 1) -- that is the only way the TP path can be put
                 on the ramp.
+            linear_iterations_it0: SCHED1 -- PCG steps for nonlinear iteration 0 under
+                ``linear_schedule="fixed"`` (both paths); every later iteration keeps
+                ``linear_iterations``.  E.g. ``2`` with ``linear_iterations=15`` is
+                "i2f15": 2 + (iterations - 1) * 15 PCG steps per substep.  ``None``
+                (the default) leaves ``"fixed"`` exactly as it was, bit for bit.
+                Setting it under any other schedule raises.
             inertia_warm_start: ITER1/ITER2 -- seed the first nonlinear iteration's PCG
                 guess with ``x_inertia - x_curr`` (the full free-flight step) instead of
                 the stock ``v_prev * dt``.  Accepts
@@ -670,6 +677,12 @@ class SolverStyle3D(SolverBase):
                 f"got {linear_schedule!r}"
             )
         self.linear_schedule = str(linear_schedule)
+        # SCHED1: iteration-0 override for "fixed" only; None = untouched.
+        if linear_iterations_it0 is not None and self.linear_schedule != "fixed":
+            raise ValueError("linear_iterations_it0 requires linear_schedule='fixed', "
+                             f"got {self.linear_schedule!r}")
+        self.linear_iterations_it0 = (None if linear_iterations_it0 is None
+                                      else max(1, int(linear_iterations_it0)))
         # ------------------------------------------------------------ ITER7
         if str(tp_reduce) not in ("legacy", "bucket"):
             raise ValueError(f"tp_reduce must be 'legacy' or 'bucket', got {tp_reduce!r}")
@@ -774,6 +787,9 @@ class SolverStyle3D(SolverBase):
             return wp.min(_iter + 1, 10)
         if self.linear_schedule == "ramp_it0":
             return self.linear_iterations if _iter == 0 else wp.min(_iter + 1, 10)
+        # SCHED1: "fixed" + `linear_iterations_it0` -- a short iteration 0 (i2f15).
+        if _iter == 0 and self.linear_iterations_it0 is not None:
+            return self.linear_iterations_it0
         # ITER7 "adaptive": `linear_iterations` is the UPPER bound only; the
         # actual step count is decided on device inside PcgSolver.solve.
         return self.linear_iterations
@@ -792,6 +808,9 @@ class SolverStyle3D(SolverBase):
             return wp.min(_iter + 1, 10)
         if self.linear_schedule == "ramp_it0":
             return self.linear_iterations if _iter == 0 else wp.min(_iter + 1, 10)
+        # SCHED1: same iteration-0 override as the non-TP path.
+        if _iter == 0 and self.linear_iterations_it0 is not None:
+            return self.linear_iterations_it0
         return self.linear_iterations
 
     # ------------------------------------------------------------- ITER3
@@ -893,13 +912,21 @@ class SolverStyle3D(SolverBase):
         """The one ``[ITER3]`` self-provenance line every run must print."""
         return ("[ITER3] coarse_correction=%d linear_schedule=%s tp=%s "
                 "linear_iterations=%d nonlinear_iterations=%d components=%d "
-                "tp_reduce=%s pcg_eta=%.4g pcg_fused=%d pcg_buckets=%d"
+                "tp_reduce=%s pcg_eta=%.4g pcg_fused=%d pcg_buckets=%d "
+                "linear_iterations_it0=%s pcg_steps_per_substep=%d"
                 % (self.coarse_correction, self.linear_schedule,
                    bool(self.enable_translation_preconditioner),
                    int(self.linear_iterations), int(self.nonlinear_iterations),
                    int(self._translation_component_count),
                    self.tp_reduce, self._pcg_eta_active, int(self.pcg_fused),
-                   int(FUSE_BUCKETS)))
+                   int(FUSE_BUCKETS), self.linear_iterations_it0,
+                   self.pcg_steps_per_substep()))
+
+    def pcg_steps_per_substep(self) -> int:
+        """SCHED1: host-side PCG step budget of one substep (upper bound for "adaptive")."""
+        steps = (self._linear_steps_tp if self.enable_translation_preconditioner
+                 else self._linear_steps)
+        return int(sum(int(steps(i)) for i in range(self.nonlinear_iterations)))
 
     # ------------------------------------------------------------- ITER2
     def _iter2_mark_contact_gate(self, state_in: State, state_out: State,
