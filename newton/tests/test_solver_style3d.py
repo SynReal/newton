@@ -74,8 +74,8 @@ def test_constructor_precomputes_fixed_pd_matrix(test, device):
 
     test.assertEqual(solver.config, config)
 
-    test.assertGreater(float(solver.pd_diags.numpy().sum()), 0.0)
-    test.assertGreater(int(solver.pd_non_diags.num_nz.numpy().sum()), 0)
+    test.assertGreater(float(solver._pd_diag.numpy().sum()), 0.0)
+    test.assertGreater(int(solver._pd_off_diag.num_nz.numpy().sum()), 0)
     _assert_pd_matrix(test, model, solver)
 
 

@@ -284,7 +284,7 @@ class SolverStyle3D(SolverBase):
                 "Style3D custom attributes are missing from the model. "
                 "Call SolverStyle3D.register_custom_attributes() before building the model."
             )
-        self.style3d = model.style3d
+        self._style3d_attr = model.style3d
         # Keep solver-specific activity constraints out of the shared model.
         self._particle_flags = wp.clone(model.particle_flags)
         if model.particle_count > 0:
@@ -296,29 +296,29 @@ class SolverStyle3D(SolverBase):
                 device=self.device,
             )
         self.collision: Collision | None = Collision(model)  # set None to disable
-        self.linear_solver = PcgSolver(model.particle_count, self.device)
+        self._linear_solver = PcgSolver(model.particle_count, self.device)
         self.config = config
 
         # Fixed PD matrix
-        self.pd_non_diags = SparseMatrixELL()
-        self.pd_diags = wp.zeros(model.particle_count, dtype=float, device=self.device)
+        self._pd_off_diag = SparseMatrixELL()
+        self._pd_diag = wp.zeros(model.particle_count, dtype=float, device=self.device)
         self._precompute(model)
 
         # Non-linear equation variables
-        self.dx = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
-        self.rhs = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
-        self.x_prev = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
-        self.x_inertia = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+        self._dx = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+        self._rhs = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+        self._x_prev = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+        self._x_inertia = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
 
         # Static part of A_diag, full A_diag, and inverse of A_diag
-        self.static_A_diags = wp.zeros(model.particle_count, dtype=float, device=self.device)
-        self.inv_A_diags = wp.zeros(model.particle_count, dtype=wp.mat33, device=self.device)
-        self.A_diags = wp.zeros(model.particle_count, dtype=wp.mat33, device=self.device)
+        self._A_diag = wp.zeros(model.particle_count, dtype=wp.mat33, device=self.device)
+        self._A_diag_base = wp.zeros(model.particle_count, dtype=float, device=self.device)
+        self._inv_A_diag = wp.zeros(model.particle_count, dtype=wp.mat33, device=self.device)
 
         # Drag info
-        self.drag_pos = wp.zeros(1, dtype=wp.vec3, device=self.device)
-        self.drag_index = wp.array([-1], dtype=int, device=self.device)
-        self.drag_bary_coord = wp.zeros(1, dtype=wp.vec3, device=self.device)
+        self._drag_pos = wp.zeros(1, dtype=wp.vec3, device=self.device)
+        self._drag_index = wp.array([-1], dtype=int, device=self.device)
+        self._drag_bary_coord = wp.zeros(1, dtype=wp.vec3, device=self.device)
 
     @override
     def step(
@@ -381,15 +381,15 @@ class SolverStyle3D(SolverBase):
                 state_in.particle_f,
                 state_in.particle_qd,
                 state_in.particle_q,
-                self.x_prev,
-                self.pd_diags,
+                self._x_prev,
+                self._pd_diag,
                 self.model.particle_mass,
                 self._particle_flags,
             ],
             outputs=[
-                self.x_inertia,
-                self.static_A_diags,
-                self.dx,
+                self._x_inertia,
+                self._A_diag_base,
+                self._dx,
             ],
             device=self.device,
         )
@@ -400,12 +400,12 @@ class SolverStyle3D(SolverBase):
                 dim=1,
                 inputs=[
                     self.config.drag_spring_stiff,
-                    self.drag_index,
-                    self.drag_bary_coord,
+                    self._drag_index,
+                    self._drag_bary_coord,
                     self.model.tri_indices,
                     self._particle_flags,
                 ],
-                outputs=[self.static_A_diags],
+                outputs=[self._A_diag_base],
                 device=self.device,
             )
 
@@ -416,10 +416,10 @@ class SolverStyle3D(SolverBase):
                 inputs=[
                     dt,
                     state_in.particle_q,
-                    self.x_inertia,
+                    self._x_inertia,
                     self.model.particle_mass,
                 ],
-                outputs=[self.rhs],
+                outputs=[self._rhs],
                 device=self.device,
             )
 
@@ -431,23 +431,23 @@ class SolverStyle3D(SolverBase):
                     self.model.tri_areas,
                     self.model.tri_poses,
                     self.model.tri_indices,
-                    self.style3d.tri_aniso_ke,
+                    self._style3d_attr.tri_aniso_ke,
                 ],
-                outputs=[self.rhs],
+                outputs=[self._rhs],
                 device=self.device,
             )
 
             wp.launch(
                 eval_bend_kernel,
-                dim=len(self.style3d.edge_rest_area),
+                dim=len(self._style3d_attr.edge_rest_area),
                 inputs=[
                     state_in.particle_q,
-                    self.style3d.edge_rest_area,
-                    self.style3d.edge_bending_cot,
+                    self._style3d_attr.edge_rest_area,
+                    self._style3d_attr.edge_bending_cot,
                     self.model.edge_indices,
                     self.model.edge_bending_properties,
                 ],
-                outputs=[self.rhs],
+                outputs=[self._rhs],
                 device=self.device,
             )
 
@@ -457,13 +457,13 @@ class SolverStyle3D(SolverBase):
                     dim=1,
                     inputs=[
                         self.config.drag_spring_stiff,
-                        self.drag_index,
-                        self.drag_pos,
-                        self.drag_bary_coord,
+                        self._drag_index,
+                        self._drag_pos,
+                        self._drag_bary_coord,
                         self.model.tri_indices,
                         state_in.particle_q,
                     ],
-                    outputs=[self.rhs],
+                    outputs=[self._rhs],
                     device=self.device,
                 )
 
@@ -474,49 +474,49 @@ class SolverStyle3D(SolverBase):
                     state_in,
                     state_out,
                     contacts,
-                    self.rhs,
-                    self.x_prev,
-                    self.static_A_diags,
+                    self._rhs,
+                    self._x_prev,
+                    self._A_diag_base,
                 )
                 wp.launch(
                     prepare_jacobi_preconditioner_kernel,
                     dim=self.model.particle_count,
                     inputs=[
-                        self.static_A_diags,
+                        self._A_diag_base,
                         self.collision.contact_hessian_diagonal(),
                         self._particle_flags,
                     ],
-                    outputs=[self.inv_A_diags],
+                    outputs=[self._inv_A_diag],
                     device=self.device,
                 )
             else:
                 wp.launch(
                     prepare_jacobi_preconditioner_no_contact_hessian_kernel,
                     dim=self.model.particle_count,
-                    inputs=[self.static_A_diags],
-                    outputs=[self.inv_A_diags],
+                    inputs=[self._A_diag_base],
+                    outputs=[self._inv_A_diag],
                     device=self.device,
                 )
 
-            self.linear_solver.solve(
-                self.pd_non_diags,
-                self.static_A_diags,
-                self.dx if _iter == 0 else None,
-                self.rhs,
-                self.inv_A_diags,
-                self.dx,
+            self._linear_solver.solve(
+                self._pd_off_diag,
+                self._A_diag_base,
+                self._dx if _iter == 0 else None,
+                self._rhs,
+                self._inv_A_diag,
+                self._dx,
                 self.config.linear_iterations,
                 None if self.collision is None else self.collision.hessian_multiply,
             )
 
             if self.collision is not None:
-                self.collision.linear_iteration_end(self.dx)
+                self.collision.linear_iteration_end(self._dx)
 
             wp.launch(
                 nonlinear_step_kernel,
                 dim=self.model.particle_count,
                 inputs=[state_in.particle_q],
-                outputs=[state_out.particle_q, self.dx],
+                outputs=[state_out.particle_q, self._dx],
                 device=self.device,
             )
 
@@ -525,7 +525,7 @@ class SolverStyle3D(SolverBase):
         wp.launch(
             kernel=update_velocity,
             dim=self.model.particle_count,
-            inputs=[dt, self.x_prev, state_out.particle_q],
+            inputs=[dt, self._x_prev, state_out.particle_q],
             outputs=[state_out.particle_qd],
             device=self.device,
         )
@@ -621,11 +621,11 @@ class SolverStyle3D(SolverBase):
                 # Only overflowing meshes pay for counting stretch and bending connections.
                 max_neighbors = _compute_max_neighbors(model.particle_count, tri_indices, edge_indices)
                 pd_matrix_builder = assemble(max_neighbors)
-            self.pd_diags, self.pd_non_diags.num_nz, self.pd_non_diags.nz_ell = pd_matrix_builder.finalize(self.device)
+            self._pd_diag, self._pd_off_diag.num_nz, self._pd_off_diag.nz_ell = pd_matrix_builder.finalize(self.device)
 
     def _update_drag_info(self, index: int, pos: wp.vec3, bary_coord: wp.vec3):
         """Should be invoked when state changed."""
         # print([index, pos, bary_coord])
-        self.drag_bary_coord.fill_(bary_coord)
-        self.drag_index.fill_(index)
-        self.drag_pos.fill_(pos)
+        self._drag_bary_coord.fill_(bary_coord)
+        self._drag_index.fill_(index)
+        self._drag_pos.fill_(pos)
