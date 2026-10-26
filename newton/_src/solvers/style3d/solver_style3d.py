@@ -296,24 +296,27 @@ class SolverStyle3D(SolverBase):
                 device=self.device,
             )
         self.collision: Collision | None = Collision(model)  # set None to disable
-        self._linear_solver = PcgSolver(model.particle_count, self.device)
         self.config = config
+
+        # Number of DOF blocks in the linear system, with three scalar DOFs per block.
+        self._dof_block_count = model.particle_count
+        self._linear_solver = PcgSolver(self._dof_block_count, self.device)
 
         # Fixed PD matrix
         self._pd_off_diag = SparseMatrixELL()
-        self._pd_diag = wp.zeros(model.particle_count, dtype=float, device=self.device)
+        self._pd_diag = wp.zeros(self._dof_block_count, dtype=float, device=self.device)
         self._precompute(model)
 
         # Non-linear equation variables
-        self._dx = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
-        self._rhs = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
-        self._x_prev = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
-        self._x_inertia = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+        self._dx = wp.zeros(self._dof_block_count, dtype=wp.vec3, device=self.device)
+        self._rhs = wp.zeros(self._dof_block_count, dtype=wp.vec3, device=self.device)
+        self._x_prev = wp.zeros(self._dof_block_count, dtype=wp.vec3, device=self.device)
+        self._x_inertia = wp.zeros(self._dof_block_count, dtype=wp.vec3, device=self.device)
 
-        # Static part of A_diag, full A_diag, and inverse of A_diag
-        self._A_diag = wp.zeros(model.particle_count, dtype=wp.mat33, device=self.device)
-        self._A_diag_base = wp.zeros(model.particle_count, dtype=float, device=self.device)
-        self._inv_A_diag = wp.zeros(model.particle_count, dtype=wp.mat33, device=self.device)
+        # Base diagonal excluding contact contributions.
+        self._A_diag_base = wp.zeros(self._dof_block_count, dtype=float, device=self.device)
+        # Inverse full diagonal blocks for Jacobi preconditioning.
+        self._inv_A_diag = wp.zeros(self._dof_block_count, dtype=wp.mat33, device=self.device)
 
         # Drag info
         self._drag_pos = wp.zeros(1, dtype=wp.vec3, device=self.device)
@@ -373,7 +376,7 @@ class SolverStyle3D(SolverBase):
 
         wp.launch(
             kernel=init_step_kernel,
-            dim=self.model.particle_count,
+            dim=self._dof_block_count,
             inputs=[
                 dt,
                 self.model.gravity,
@@ -412,7 +415,7 @@ class SolverStyle3D(SolverBase):
         for _iter in range(self.config.iterations):
             wp.launch(
                 init_rhs_kernel,
-                dim=self.model.particle_count,
+                dim=self._dof_block_count,
                 inputs=[
                     dt,
                     state_in.particle_q,
@@ -480,7 +483,7 @@ class SolverStyle3D(SolverBase):
                 )
                 wp.launch(
                     prepare_jacobi_preconditioner_kernel,
-                    dim=self.model.particle_count,
+                    dim=self._dof_block_count,
                     inputs=[
                         self._A_diag_base,
                         self.collision.contact_hessian_diagonal(),
@@ -492,7 +495,7 @@ class SolverStyle3D(SolverBase):
             else:
                 wp.launch(
                     prepare_jacobi_preconditioner_no_contact_hessian_kernel,
-                    dim=self.model.particle_count,
+                    dim=self._dof_block_count,
                     inputs=[self._A_diag_base],
                     outputs=[self._inv_A_diag],
                     device=self.device,
@@ -514,7 +517,7 @@ class SolverStyle3D(SolverBase):
 
             wp.launch(
                 nonlinear_step_kernel,
-                dim=self.model.particle_count,
+                dim=self._dof_block_count,
                 inputs=[state_in.particle_q],
                 outputs=[state_out.particle_q, self._dx],
                 device=self.device,
@@ -524,7 +527,7 @@ class SolverStyle3D(SolverBase):
 
         wp.launch(
             kernel=update_velocity,
-            dim=self.model.particle_count,
+            dim=self._dof_block_count,
             inputs=[dt, self._x_prev, state_out.particle_q],
             outputs=[state_out.particle_qd],
             device=self.device,
@@ -610,7 +613,7 @@ class SolverStyle3D(SolverBase):
 
             def assemble(max_neighbors):
                 """Assemble from scratch so failed attempts never contribute partial entries."""
-                matrix = PDMatrixBuilder(model.particle_count, max_neighbor=max_neighbors)
+                matrix = PDMatrixBuilder(self._dof_block_count, max_neighbor=max_neighbors)
                 matrix.add_stretch_constraints(tri_indices, tri_poses, tri_aniso_ke, tri_areas)
                 matrix.add_bend_constraints(edge_indices, edge_bending_properties, edge_rest_area, edge_bending_cot)
                 return matrix
@@ -619,7 +622,7 @@ class SolverStyle3D(SolverBase):
                 pd_matrix_builder = assemble(32)
             except ValueError:
                 # Only overflowing meshes pay for counting stretch and bending connections.
-                max_neighbors = _compute_max_neighbors(model.particle_count, tri_indices, edge_indices)
+                max_neighbors = _compute_max_neighbors(self._dof_block_count, tri_indices, edge_indices)
                 pd_matrix_builder = assemble(max_neighbors)
             self._pd_diag, self._pd_off_diag.num_nz, self._pd_off_diag.nz_ell = pd_matrix_builder.finalize(self.device)
 
