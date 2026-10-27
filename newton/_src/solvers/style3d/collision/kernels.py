@@ -528,6 +528,9 @@ _T18_SDF_ANCHOR_FIX = wp.constant(_T18_FIX_RAW)
 _T18_FIX_TAN = wp.constant(1 if (_T18_FIX_RAW & 1) else 0)
 _T18_FIX_DRAG = wp.constant(1 if (_T18_FIX_RAW & 2) else 0)
 _T18_FIX_NRM = wp.constant(1 if (_T18_FIX_RAW & 4) else 0)
+# T80 anchor shell check（默认 0 ⇒ 逐位不变）：锚住的材料点自己出了壳就不再借三角形最深点的
+# 法向载荷当摩擦锥（迭代 0 重播种，其余迭代锥为 0），见力核里锚分支的注释。
+_T80_ANCHOR_SHELL = wp.constant(int(__import__("os").environ.get("T80_ANCHOR_SHELL", "0")))
 
 
 @wp.struct
@@ -4525,6 +4528,25 @@ def eval_tri_sdf_contact_kernel(
             q_loc = a * aw[0] + b * aw[1] + c * aw[2]
             kt = k * anchor_kt_ratio
             cone = mu * f_n
+            # T80: the cone above is the load at the triangle's DEEPEST point (``best``), but the anchor spring
+            # pulls the seeded material point.  Once the triangle tilts (jaw opening) that point can sit outside
+            # the shell while the deepest corner is still loaded, and the anchor keeps holding the cloth with a
+            # borrowed load -- the cloth hangs on / is lifted by the opened jaw.  So: on iteration 0 an anchor
+            # whose material point left the shell is dropped and re-seeded here; on later iterations (the seed
+            # is frozen) such a point gets no cone.  A point still inside keeps the whole cone, so grasp holding
+            # is unchanged.  0 = OFF, bit-identical.
+            # wp.static: with the switch off not one statement is emitted, so the kernel is the pre-T80 code.
+            if wp.static(_T80_ANCHOR_SHELL != 0):
+                if seeded != 0:
+                    d_mat, n_mat = sdf_query(sdf_mesh[slot], gx, slot, half_thickness + 0.01, bg, q_loc)
+                    if d_mat >= half_thickness:
+                        if anchor_seed != 0:
+                            seeded = 0
+                            anchor_valid[pair] = 0
+                            aw = w
+                            q_loc = a * aw[0] + b * aw[1] + c * aw[2]
+                        else:
+                            cone = 0.0
             if anchor_seed != 0:
                 # T13 fix3': seeding and the elastoplastic RETURN MAPPING happen
                 # once per substep, on iteration 0, but evaluated in the PREVIOUS
@@ -5136,6 +5158,12 @@ def accumulate_tri_sdf_reaction_kernel(
             slip_t = slip_w - n_world * wp.dot(slip_w, n_world)
             f_t = slip_t * (-tri_stiffness[t] * anchor_kt_ratio)
             cone = mu * f_n
+            if wp.static(_T80_ANCHOR_SHELL != 0):
+                # T80: same rule as the force kernel -- an anchored material point out of the shell has no cone
+                if depth > 0.0:
+                    d_mat, n_mat = sdf_query(sdf_mesh[slot], gx, slot, half_thickness + 0.01, bg, a * aw[0] + b * aw[1] + c * aw[2])
+                    if d_mat >= half_thickness:
+                        cone = 0.0
             m = wp.length(f_t)
             if m > cone and m > 1.0e-12:
                 f_t = f_t * (cone / m)
