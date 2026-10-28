@@ -302,6 +302,13 @@ class Collision:
         self.tri_bvh = BvhTri(model.tri_count, self.model.device)
         self.edge_bvh = BvhEdge(model.edge_count, self.model.device)
         self.body_contact_max = model.shape_count * model.particle_count
+        # BCL: thread count of the per-iteration body-particle contact launch.
+        # 0 = stock (``body_contact_max`` threads, one per contact slot; all but
+        # the live ``soft_contact_count`` exit at once -- ~1.9M threads for a
+        # 9k-vertex cloth vs ~1e4 live contacts).  > 0 = that many threads in a
+        # grid-stride loop over the live contacts: same per-contact evaluation,
+        # fixed dim so the launch stays CUDA-graph capturable.
+        self.body_contact_launch_dim = 0
         self.broad_phase_ee = wp.array(shape=(32, model.edge_count), dtype=int, device=self.model.device)
         self.broad_phase_ef = wp.array(shape=(32, model.edge_count), dtype=int, device=self.model.device)
         self.broad_phase_vf = wp.array(shape=(32, model.particle_count), dtype=int, device=self.model.device)
@@ -1303,9 +1310,10 @@ class Collision:
                 device=self.model.device,
             )
 
+        bcl_dim = self.body_contact_launch_dim if self.body_contact_launch_dim > 0 else self.body_contact_max
         wp.launch(
             kernel=eval_body_contact_kernel,
-            dim=self.body_contact_max,
+            dim=bcl_dim,
             inputs=[
                 dt,
                 particle_q_prev,
@@ -1344,6 +1352,7 @@ class Collision:
                 self.avbd_dual_k,
                 self.lambda_t,
                 self.lambda_shape,
+                bcl_dim,
             ],
             outputs=[particle_forces, self.contact_hessian_diags],
             device=self.model.device,

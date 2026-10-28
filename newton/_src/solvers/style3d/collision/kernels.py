@@ -2082,15 +2082,16 @@ def eval_body_contact_kernel(
     avbd_dual_k: float,
     lambda_t: wp.array[wp.vec3],
     lambda_shape: wp.array[int],
+    # BCL: thread stride of a grid-stride loop over the live contacts; equal to
+    # the launch dim (the stock launch passes contact_max, i.e. one contact per thread)
+    launch_stride: int,
     # outputs: particle force and hessian
     forces: wp.array[wp.vec3],
     hessians: wp.array[wp.mat33],
 ):
-    t_id = wp.tid()
-
     particle_body_contact_count = wp.min(contact_max, contact_count[0])
 
-    if t_id < particle_body_contact_count:
+    for t_id in range(wp.tid(), particle_body_contact_count, launch_stride):
         particle_idx = soft_contact_particle[t_id]
         shape_idx = contact_shape[t_id]
         if avbd_dual_k > 0.0:
@@ -2118,7 +2119,7 @@ def eval_body_contact_kernel(
             )
             wp.atomic_add(forces, particle_idx, f_v)
             wp.atomic_add(hessians, particle_idx, h_v)
-            return
+            continue
         if anchor_kt_ratio > 0.0:
             f_a, h_a = eval_body_particle_contact_anchored(
                 particle_idx,
@@ -2144,7 +2145,7 @@ def eval_body_contact_kernel(
             )
             wp.atomic_add(forces, particle_idx, f_a)
             wp.atomic_add(hessians, particle_idx, h_a)
-            return
+            continue
         body_contact_force, body_contact_hessian = evaluate_body_particle_contact_banded(
             pos[particle_idx],
             pos_prev[particle_idx],
