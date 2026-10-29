@@ -368,6 +368,10 @@ def test_solver_flags_deactivate_zero_mass_without_mutating_model(test, device):
     solver = newton.solvers.SolverStyle3D(
         model, config=newton.solvers.SolverStyle3D.Config(iterations=1, linear_iterations=1)
     )
+    state_0 = model.state()
+    state_1 = model.state()
+    contacts = newton.CollisionPipeline(model).contacts()
+    solver.step(state_0, state_1, model.control(), contacts, 0.01)
 
     np.testing.assert_array_equal(model.particle_flags.numpy(), model_flags)
     solver_flags = solver._particle_flags.numpy()

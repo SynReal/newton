@@ -285,22 +285,15 @@ class SolverStyle3D(SolverBase):
                 "Call SolverStyle3D.register_custom_attributes() before building the model."
             )
         self._style3d_attr = model.style3d
-        # Keep solver-specific activity constraints out of the shared model.
-        self._particle_flags = wp.clone(model.particle_flags)
-        if model.particle_count > 0:
-            wp.launch(
-                deactivate_zero_mass_particles_kernel,
-                dim=model.particle_count,
-                inputs=[model.particle_mass],
-                outputs=[self._particle_flags],
-                device=self.device,
-            )
         self.collision: Collision | None = Collision(model)  # set None to disable
         self.config = config
 
         # Number of DOF blocks in the linear system, with three scalar DOFs per block.
         self._dof_block_count = model.particle_count
         self._linear_solver = PcgSolver(self._dof_block_count, self.device)
+
+        # Keep solver-specific activity constraints out of the shared model.
+        self._particle_flags = wp.clone(model.particle_flags)
 
         # Fixed PD matrix
         self._pd_off_diag = SparseMatrixELL()
